@@ -46,7 +46,8 @@ class CapturePlan:
 
 
 def die(message: str, code: int = 1) -> None:
-    raise SystemExit(f"{message}")
+    sys.stderr.write(f"{message}\n")
+    raise SystemExit(code)
 
 
 def validate_consent(consent_confirmed: bool) -> None:
@@ -489,12 +490,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.target == "window":
         if not args.query:
             die("window target requires at least one --query", EXIT_USAGE)
+        linux_window_tools = detect_tools(("xdotool", "import")) if platform_name == "Linux" else {}
         for query in args.query:
             if platform_name == "Darwin":
                 resolution = resolve_macos_with_helper(query, args.allow_multiple_matches, False, skill_dir)
             elif platform_name == "Linux":
-                tools = detect_tools(("xdotool", "import"))
-                resolution = resolve_linux_named_window(query, args.allow_multiple_matches, tools)
+                resolution = resolve_linux_named_window(query, args.allow_multiple_matches, linux_window_tools)
             else:
                 resolution = ResolutionResult(False, "unsupported_platform", f"unsupported platform: {platform_name}")
             if not resolution.ok:

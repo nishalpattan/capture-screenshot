@@ -27,8 +27,9 @@ class CaptureScreenshotUnitTests(unittest.TestCase):
         self.mod = load_module()
 
     def test_requires_explicit_consent(self):
-        with self.assertRaisesRegex(SystemExit, "consent"):
+        with self.assertRaises(SystemExit) as cm:
             self.mod.validate_consent(False)
+        self.assertEqual(cm.exception.code, self.mod.EXIT_PRIVACY)
 
     def test_request_folder_uses_required_timestamp_format(self):
         folder = self.mod.request_folder_name(self.mod.dt.datetime(2026, 6, 5, 16, 40, 12))
@@ -65,8 +66,9 @@ class CaptureScreenshotUnitTests(unittest.TestCase):
             real.mkdir()
             link = root / "screenshots"
             link.symlink_to(real, target_is_directory=True)
-            with self.assertRaisesRegex(SystemExit, "symlink"):
+            with self.assertRaises(SystemExit) as cm:
                 self.mod.ensure_private_directory(link)
+        self.assertEqual(cm.exception.code, self.mod.EXIT_PRIVACY)
 
     def test_desktop_folder_is_private(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -148,19 +150,28 @@ class CaptureScreenshotUnitTests(unittest.TestCase):
 
     def test_windows_delegates_to_powershell(self):
         with tempfile.TemporaryDirectory() as tmp:
+            args_file = Path(tmp) / "captured_args.txt"
             fake_ps = Path(tmp) / "powershell.exe"
-            fake_ps.write_text("#!/bin/sh\necho 'fake/path.png'\n")
+            # Write every argv entry on its own line so we can assert each flag.
+            fake_ps.write_text(
+                f'#!/bin/sh\nprintf "%s\\n" "$@" > {args_file}\necho "fake/path.png"\n'
+            )
             fake_ps.chmod(0o755)
             env = os.environ.copy()
             env["PATH"] = f"{tmp}:{env.get('PATH', '')}"
             env["CAPTURE_SCREENSHOT_TEST_PLATFORM"] = "Windows"
             proc = subprocess.run(
                 [sys.executable, str(SCRIPT),
-                 "--consent-confirmed", "--destination", "desktop", "--target", "fullscreen", "--dry-run"],
+                 "--consent-confirmed", "--destination", "desktop",
+                 "--target", "fullscreen", "--dry-run"],
                 capture_output=True, text=True, env=env,
             )
             self.assertEqual(proc.returncode, 0)
             self.assertIn("fake/path.png", proc.stdout)
+            captured = args_file.read_text()
+            for expected in ("-ConsentConfirmed", "-Destination", "desktop",
+                             "-Target", "fullscreen", "-DryRun"):
+                self.assertIn(expected, captured, msg=f"flag {expected!r} not forwarded to PowerShell")
 
     def test_windows_requires_powershell(self):
         env = os.environ.copy()

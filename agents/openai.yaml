@@ -2,3 +2,6 @@ interface:
   display_name: "Capture Screenshot"
   short_description: "User-directed local screenshots with explicit consent; no external database"
   default_prompt: "Capture a screenshot of my current screen."
+
+policy:
+  allow_implicit_invocation: true

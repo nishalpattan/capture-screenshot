@@ -89,7 +89,12 @@ function Protect-Directory {
 
     $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
     $acl = Get-Acl -LiteralPath $Path
+    # Block inheritance; then purge ALL existing explicit ACEs so pre-existing
+    # foreign rules (e.g. Everyone:Allow on a shared machine) cannot survive.
     $acl.SetAccessRuleProtection($true, $false)
+    foreach ($rule in @($acl.Access)) {
+        $acl.RemoveAccessRule($rule) | Out-Null
+    }
     $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
         $identity,
         'FullControl',
@@ -97,7 +102,7 @@ function Protect-Directory {
         'None',
         'Allow'
     )
-    $acl.SetAccessRule($rule)
+    $acl.AddAccessRule($rule)
     Set-Acl -LiteralPath $Path -AclObject $acl
 }
 
@@ -105,9 +110,14 @@ function Protect-File {
     param([string]$Path)
     $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
     $acl = Get-Acl -LiteralPath $Path
+    # Block inheritance and purge all existing explicit ACEs before adding the
+    # owner-only rule, matching the replace-not-merge semantics of Protect-Directory.
     $acl.SetAccessRuleProtection($true, $false)
+    foreach ($rule in @($acl.Access)) {
+        $acl.RemoveAccessRule($rule) | Out-Null
+    }
     $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($identity, 'FullControl', 'Allow')
-    $acl.SetAccessRule($rule)
+    $acl.AddAccessRule($rule)
     Set-Acl -LiteralPath $Path -AclObject $acl
 }
 
@@ -145,8 +155,18 @@ function New-TemporaryCapturePath {
     $stem = [IO.Path]::GetFileNameWithoutExtension($FinalPath)
     for ($i = 0; $i -lt 1000; $i++) {
         $candidate = Join-Path $Folder ('.{0}.{1}.{2:D3}.tmp.png' -f $stem, $PID, $i)
-        if (-not (Test-Path -LiteralPath $candidate)) {
+        try {
+            # CreateNew + exclusive share mode: atomic, no TOCTOU race.
+            $stream = [System.IO.File]::Open(
+                $candidate,
+                [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::None
+            )
+            $stream.Close()
             return $candidate
+        } catch [System.IO.IOException] {
+            continue
         }
     }
     throw 'could not allocate a private temporary screenshot file'
@@ -239,9 +259,17 @@ function Capture-ToDestination {
             $path = New-CapturePath -Folder $script:RequestFolder -Label $Label
             $tempPath = New-TemporaryCapturePath -Folder $script:RequestFolder -FinalPath $path
             try {
-                $bitmap.Save($tempPath, [Drawing.Imaging.ImageFormat]::Png)
+                # Secure the empty temp file before writing so the PNG bytes are
+                # never readable by other users, even for a brief window.
                 Protect-File -Path $tempPath
-                if (Test-Path -LiteralPath $path) {
+                $bitmap.Save($tempPath, [Drawing.Imaging.ImageFormat]::Png)
+                # Guard against both existing files and dangling reparse points
+                # (Test-Path returns $false for dangling junctions/symlinks).
+                $destItem = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+                if ($destItem) {
+                    if (($destItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                        throw 'refusing to overwrite a reparse-point at the screenshot destination'
+                    }
                     throw 'refusing to overwrite an existing screenshot path'
                 }
                 Move-Item -LiteralPath $tempPath -Destination $path -ErrorAction Stop

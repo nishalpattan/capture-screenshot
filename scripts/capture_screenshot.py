@@ -440,6 +440,25 @@ def _validate_output_root(path: Path) -> None:
         die("output-root must be within the user home directory", EXIT_USAGE)
 
 
+def _run_powershell_script(args: argparse.Namespace, skill_dir: Path) -> int:
+    ps_script = skill_dir / "scripts" / "capture_screenshot.ps1"
+    powershell = shutil.which("powershell.exe") or shutil.which("pwsh")
+    if not powershell:
+        die("PowerShell is required for Windows capture but was not found", EXIT_UNAVAILABLE)
+    if not ps_script.exists():
+        die("Windows capture script is missing", EXIT_UNAVAILABLE)
+    cmd = [powershell, "-NoProfile", "-Sta", "-File", str(ps_script),
+           "-ConsentConfirmed", "-Destination", args.destination, "-Target", args.target]
+    for q in args.query:
+        cmd += ["-Query", q]
+    cmd += ["-OutputRoot", str(args.output_root)]
+    if args.allow_multiple_matches:
+        cmd.append("-AllowMultipleMatches")
+    if args.dry_run:
+        cmd.append("-DryRun")
+    return subprocess.run(cmd).returncode
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Privacy-first screenshot capture helper")
     parser.add_argument("--consent-confirmed", action="store_true", help="confirm user approved capture and destination")
@@ -460,6 +479,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     platform_name = _test_platform() or platform.system()
     skill_dir = Path(__file__).resolve().parents[1]
+
+    if platform_name == "Windows":
+        return _run_powershell_script(args, skill_dir)
+
     labels: list[str] = []
     window_ids: list[str] = []
 

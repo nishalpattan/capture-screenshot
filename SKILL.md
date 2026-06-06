@@ -61,6 +61,15 @@ python3 "$SKILL_DIR/scripts/capture_screenshot.py" \
 Windows 11+:
 
 ```powershell
+python "$env:SKILL_DIR\scripts\capture_screenshot.py" `
+  --consent-confirmed `
+  --destination desktop `
+  --target fullscreen
+```
+
+The Python script detects Windows and delegates to the bundled PowerShell script automatically. As a fallback when Python is unavailable, invoke the PowerShell script directly:
+
+```powershell
 powershell.exe -NoProfile -Sta -File "$env:SKILL_DIR\scripts\capture_screenshot.ps1" `
   -ConsentConfirmed `
   -Destination desktop `

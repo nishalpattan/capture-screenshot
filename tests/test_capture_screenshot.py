@@ -146,6 +146,35 @@ class CaptureScreenshotUnitTests(unittest.TestCase):
             self.assertNotIn("Secret Roadmap", proc.stdout)
             self.assertFalse(output_root.exists())
 
+    def test_windows_delegates_to_powershell(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_ps = Path(tmp) / "powershell.exe"
+            fake_ps.write_text("#!/bin/sh\necho 'fake/path.png'\n")
+            fake_ps.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{tmp}:{env.get('PATH', '')}"
+            env["CAPTURE_SCREENSHOT_TEST_PLATFORM"] = "Windows"
+            proc = subprocess.run(
+                [sys.executable, str(SCRIPT),
+                 "--consent-confirmed", "--destination", "desktop", "--target", "fullscreen", "--dry-run"],
+                capture_output=True, text=True, env=env,
+            )
+            self.assertEqual(proc.returncode, 0)
+            self.assertIn("fake/path.png", proc.stdout)
+
+    def test_windows_requires_powershell(self):
+        env = os.environ.copy()
+        env["CAPTURE_SCREENSHOT_TEST_PLATFORM"] = "Windows"
+        env["PATH"] = ""
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "--consent-confirmed", "--destination", "desktop", "--target", "fullscreen"],
+            capture_output=True, text=True, env=env,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("PowerShell", combined)
+
     def test_skill_notice_documents_privacy_consent_and_intended_use(self):
         text = SKILL_MD.read_text(encoding="utf-8").lower()
         required_phrases = [

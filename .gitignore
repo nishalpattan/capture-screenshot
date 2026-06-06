@@ -1,0 +1,19 @@
+# macOS metadata
+.DS_Store
+__MACOSX/
+._*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Build artifacts
+*.o
+find_macos_window_id
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo

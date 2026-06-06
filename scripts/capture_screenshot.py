@@ -63,7 +63,19 @@ def sanitize_label(value: Optional[str]) -> str:
     label = re.sub(r"https?://", "", label)
     label = re.sub(r"[^a-z0-9]+", "-", label)
     label = re.sub(r"-+", "-", label).strip("-")
-    return label[:80] or "capture"
+    return label[:80].strip("-") or "capture"
+
+
+def _escape_ere(value: str) -> str:
+    """Escape a string so it is treated as a literal by Extended Regular Expression engines."""
+    return re.sub(r'([][\\.*+?{}()|^$])', r'\\\1', value)
+
+
+def _validate_integer_ids(ids: tuple[str, ...], source: str) -> tuple[str, ...]:
+    for id_str in ids:
+        if not id_str.isdigit():
+            die(f"invalid window id from {source}: {id_str!r}", EXIT_USAGE)
+    return ids
 
 
 def unique_capture_path(folder: Path, label: str, reserved: Optional[set[Path]] = None) -> Path:
@@ -258,6 +270,11 @@ def _test_windows() -> Optional[list[dict[str, object]]]:
     parsed = json.loads(raw)
     if not isinstance(parsed, list):
         die("test window data must be a list", EXIT_USAGE)
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            die("test window data must be a list of dicts", EXIT_USAGE)
+        if "id" in entry and not isinstance(entry["id"], int):
+            die("test window id must be an integer", EXIT_USAGE)
     return parsed
 
 
@@ -285,7 +302,10 @@ def resolve_macos_with_helper(query: str, allow_multiple: bool, active: bool, sk
             command.append(query)
         proc = subprocess.run(command, capture_output=True, text=True)
     if proc.returncode == 0:
-        ids = tuple(line.strip() for line in proc.stdout.splitlines() if line.strip())
+        ids = _validate_integer_ids(
+            tuple(line.strip() for line in proc.stdout.splitlines() if line.strip()),
+            "macOS window helper",
+        )
         return ResolutionResult(True, "ok", "ok", ids)
     if proc.returncode == 2:
         return ResolutionResult(False, "no_matching_window", "No matching on-screen window found.")
@@ -298,10 +318,14 @@ def resolve_linux_named_window(query: str, allow_multiple: bool, tools: dict[str
     xdotool = tools.get("xdotool")
     if not xdotool:
         return ResolutionResult(False, "missing_dependency_xdotool", "xdotool is unavailable.")
-    proc = subprocess.run([xdotool, "search", "--name", query], capture_output=True, text=True)
+    # xdotool --name uses ERE; escape the query so it matches literally.
+    proc = subprocess.run([xdotool, "search", "--name", _escape_ere(query)], capture_output=True, text=True)
     if proc.returncode != 0:
         return ResolutionResult(False, "no_matching_window", "No matching on-screen window found.")
-    ids = tuple(line.strip() for line in proc.stdout.splitlines() if line.strip())
+    ids = _validate_integer_ids(
+        tuple(line.strip() for line in proc.stdout.splitlines() if line.strip()),
+        "xdotool",
+    )
     if not ids:
         return ResolutionResult(False, "no_matching_window", "No matching on-screen window found.")
     if len(ids) > 1 and not allow_multiple:
@@ -408,6 +432,14 @@ def execute_plan(plan: CapturePlan, output_paths: list[Path], destination: str, 
         print(output)
 
 
+def _validate_output_root(path: Path) -> None:
+    home = Path.home().resolve()
+    try:
+        path.resolve().relative_to(home)
+    except ValueError:
+        die("output-root must be within the user home directory", EXIT_USAGE)
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Privacy-first screenshot capture helper")
     parser.add_argument("--consent-confirmed", action="store_true", help="confirm user approved capture and destination")
@@ -423,6 +455,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     validate_consent(args.consent_confirmed)
+    if args.destination == "desktop" and not args.dry_run:
+        _validate_output_root(args.output_root)
 
     platform_name = _test_platform() or platform.system()
     skill_dir = Path(__file__).resolve().parents[1]

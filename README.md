@@ -49,6 +49,7 @@ OpenCode also recognises `.claude/skills/` and `.agents/skills/` automatically.
 ## What it does
 
 - **Captures the screen or any named window** using native OS tools — no third-party dependencies on macOS or Windows
+- **Grabs background & occluded windows by name** — even when they're behind other windows — without raising them or stealing focus. Minimized windows can't be captured by any OS, so the skill says so clearly and asks you to restore them rather than capturing the wrong thing
 - **Saves locally with owner-only permissions** (`~/Desktop/screenshots/MM_DD_YYYY_HH_MM_SS/<label>.png`) or copies to the clipboard
 - **Requires explicit user approval** before every capture — never runs silently or falls back to a wider capture scope
 
@@ -59,7 +60,7 @@ OpenCode also recognises `.claude/skills/` and `.agents/skills/` automatically.
 | OS | Required tools |
 |----|----------------|
 | macOS | Built-in `screencapture`; `clang` (Command Line Tools) for named/active-window capture |
-| Linux | One of: `gnome-screenshot`, `grim`+`wl-copy`, `spectacle`, `scrot`, or ImageMagick `import` |
+| Linux | One of: `gnome-screenshot`, `grim`+`wl-copy`, `spectacle`, `scrot`, or ImageMagick `import`. Named-window capture also uses `xdotool`; `xprop`/`xwininfo` are optional, for minimized-window detection |
 | Windows | Python 3 + PowerShell (built-in on Windows 11+) |
 
 See [`references/dependencies.md`](references/dependencies.md) for per-distro package names and macOS permission routing.
@@ -94,7 +95,14 @@ Screenshot the active window.
 ```
 Take a screenshot of the Terminal window.
 ```
-Fails safely if multiple windows match — asks for a more specific name rather than guessing.
+Works even if the window is in the background or covered by other windows — it captures the window's own content without raising it or stealing focus. Fails safely if multiple windows match — asks for a more specific name rather than guessing.
+
+### Minimized window
+
+```
+Screenshot the Slack window.   # …while Slack is minimized
+```
+No OS can capture a minimized window (it has no live image). Instead of guessing, the skill reports it clearly — *"'Slack' is minimized — restore it and retry."* — and exits without capturing. Restore the window and ask again.
 
 ### Multiple named windows
 
@@ -138,8 +146,11 @@ Show me where the screenshot would be saved, but don't actually capture anything
 ## Safety guarantees
 
 - Never falls back from `window` or `active` to `fullscreen` without separate approval
+- Captures occluded/background windows without raising them or stealing focus; never auto-restores, raises, or minimizes a window
+- Minimized windows are reported, not captured — and never silently swapped for the wrong window or the whole screen
 - Refuses to write into symlinked folders or paths outside your home directory
 - Multiple window matches cause the skill to ask for clarification, not capture all
+- Warns you before any step that can trigger an OS permission prompt (macOS Screen Recording); the skill never uses Automation/app-control to capture
 
 ---
 

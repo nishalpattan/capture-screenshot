@@ -138,7 +138,11 @@ def not_capturable_message(query: str, state: str = "unknown") -> str:
     """Actionable message for a window that matched but cannot be captured.
 
     Echoes only the user's query, never the real window title, to preserve the
-    privacy invariant. ``state`` is a best-effort hint from the OS helper.
+    privacy invariant. ``state`` is a best-effort hint from the OS layer:
+    Linux passes "minimized" (from xprop/xwininfo); the macOS helper cannot
+    reliably distinguish minimized from off-Space so it always reports
+    "unknown" (the generic branch). "offscreen" is reserved for a future
+    classifier and is not currently emitted by any platform.
     """
     if state == "minimized":
         return f"'{query}' is minimized — restore it and retry."
@@ -557,7 +561,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     validate_consent(args.consent_confirmed)
-    if args.destination == "desktop" and not args.dry_run:
+    # Enforce home-containment unconditionally — even on --dry-run, which still
+    # prints paths derived from output_root, so it must never advertise a path
+    # outside the user's home directory.
+    if args.destination == "desktop":
         _validate_output_root(args.output_root)
 
     platform_name = _test_platform() or platform.system()

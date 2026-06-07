@@ -10,6 +10,12 @@ clone_if_missing() {
   local dest="$1"
   local label="$2"
   DETECTED+=("$label")
+  # Check for a symlink first: -d and -e follow symlinks, so a symlinked dest
+  # could otherwise redirect the clone outside the intended skills directory.
+  if [ -L "$dest" ]; then
+    echo "  warning: $dest is a symlink — skipping $label"
+    return
+  fi
   if [ -d "$dest" ]; then
     echo "  already installed at $dest — skipping"
     return

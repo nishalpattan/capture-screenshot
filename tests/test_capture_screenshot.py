@@ -155,7 +155,9 @@ class CaptureScreenshotUnitTests(unittest.TestCase):
         self.assertEqual(result.ids, ("2",))
 
     def test_macos_minimized_cli_exits_not_capturable_without_leaking_title(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        # output-root must live under $HOME: home-containment is now enforced
+        # even on --dry-run.
+        with tempfile.TemporaryDirectory(dir=str(Path.home())) as tmp:
             output_root = Path(tmp) / "screenshots"
             env = os.environ.copy()
             env["CAPTURE_SCREENSHOT_TEST_PLATFORM"] = "Darwin"
@@ -204,6 +206,53 @@ class CaptureScreenshotUnitTests(unittest.TestCase):
             self.assertTrue(result.ok)
             self.assertEqual(result.ids, ("12345",))
 
+    def test_linux_xwininfo_only_fallback_classifies_viewable(self):
+        # No xprop available; classification must fall back to xwininfo.
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            tools = {
+                "xdotool": self._write_fake_tool(d / "xdotool", "echo 12345\n"),
+                "xwininfo": self._write_fake_tool(d / "xwininfo", 'echo "  Map State: IsViewable"\n'),
+            }
+            result = self.mod.resolve_linux_named_window("Calculator", False, tools)
+            self.assertTrue(result.ok)
+            self.assertEqual(result.ids, ("12345",))
+
+    def test_linux_no_classifier_tools_keeps_all_ids(self):
+        # Neither xprop nor xwininfo present: cannot classify, so the id is kept
+        # (degrade to pre-classification behaviour rather than dropping windows).
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            tools = {"xdotool": self._write_fake_tool(d / "xdotool", "echo 12345\n")}
+            result = self.mod.resolve_linux_named_window("Calculator", False, tools)
+            self.assertTrue(result.ok)
+            self.assertEqual(result.ids, ("12345",))
+
+    def test_macos_allow_multiple_returns_all_capturable(self):
+        result = self.mod.resolve_macos_window_ids(
+            query="Chrome",
+            windows=[
+                {"id": 1, "owner": "Chrome", "title": "a"},
+                {"id": 2, "owner": "Chrome", "title": "b", "capturable": False, "state": "minimized"},
+                {"id": 3, "owner": "Chrome", "title": "c"},
+            ],
+            allow_multiple=True,
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.ids, ("1", "3"))
+
+    def test_die_resolution_maps_exit_codes(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.mod.die_resolution(
+                self.mod.ResolutionResult(False, "window_not_capturable", "x")
+            )
+        self.assertEqual(cm.exception.code, self.mod.EXIT_NOT_CAPTURABLE)
+        with self.assertRaises(SystemExit) as cm2:
+            self.mod.die_resolution(
+                self.mod.ResolutionResult(False, "no_matching_window", "x")
+            )
+        self.assertEqual(cm2.exception.code, self.mod.EXIT_UNAVAILABLE)
+
     def test_linux_wayland_missing_tools_fails_closed(self):
         plan = self.mod.plan_capture(
             platform_name="Linux",
@@ -218,7 +267,9 @@ class CaptureScreenshotUnitTests(unittest.TestCase):
         self.assertFalse(plan.commands)
 
     def test_dry_run_output_has_no_window_title_metadata(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        # output-root must live under $HOME: home-containment is now enforced
+        # even on --dry-run.
+        with tempfile.TemporaryDirectory(dir=str(Path.home())) as tmp:
             output_root = Path(tmp) / "screenshots"
             env = os.environ.copy()
             env["CAPTURE_SCREENSHOT_TEST_PLATFORM"] = "Darwin"

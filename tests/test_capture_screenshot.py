@@ -70,6 +70,21 @@ class CaptureScreenshotUnitTests(unittest.TestCase):
                 self.mod.ensure_private_directory(link)
         self.assertEqual(cm.exception.code, self.mod.EXIT_PRIVACY)
 
+    def test_private_temp_png_is_not_hidden(self):
+        # macOS `screencapture` refuses to write to dot-prefixed (hidden) paths,
+        # so the private temp file must not start with a leading dot.
+        with tempfile.TemporaryDirectory() as tmp:
+            final = Path(tmp) / "screen.png"
+            temp = self.mod.private_temp_png(final)
+            try:
+                self.assertFalse(temp.name.startswith("."), msg=f"temp file is hidden: {temp.name}")
+                self.assertTrue(temp.name.endswith(".tmp.png"))
+                self.assertTrue(temp.exists())
+                self.assertEqual(stat.S_IMODE(temp.stat().st_mode), 0o600)
+            finally:
+                if temp.exists():
+                    temp.unlink()
+
     def test_desktop_folder_is_private(self):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "screenshots"

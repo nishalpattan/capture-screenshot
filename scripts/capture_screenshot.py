@@ -352,8 +352,11 @@ def prepare_output_paths(destination: str, output_root: Path, labels: list[str],
 
 
 def private_temp_png(final_path: Path) -> Path:
+    # The temp file must not be hidden (leading dot): macOS `screencapture`
+    # refuses to write to dot-prefixed destinations. Privacy is already ensured
+    # by the O_EXCL/0o600 creation below inside the 0o700 request directory.
     for index in range(1000):
-        temp_path = final_path.parent / f".{final_path.stem}.{os.getpid()}.{index:03d}.tmp.png"
+        temp_path = final_path.parent / f"{final_path.stem}.{os.getpid()}.{index:03d}.tmp.png"
         try:
             descriptor = os.open(temp_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:

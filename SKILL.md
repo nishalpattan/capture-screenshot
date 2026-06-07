@@ -80,7 +80,7 @@ powershell.exe -NoProfile -Sta -File "$env:SKILL_DIR\scripts\capture_screenshot.
 
 - Never fall back from `window` or `active` to `fullscreen` without separate approval.
 - If a named-window query has multiple matches, ask for a more specific target. Do not print private titles unless the user explicitly approves a sensitive listing flow.
-- If a minimized/hidden window has no drawable contents, ask the user to restore it or approve an OS-specific activation workflow.
+- Background/occluded windows capture their own content without being raised; the skill does not steal focus. Minimized windows have no drawable contents — the helper reports them as `window_not_capturable` (exit 75). Ask the user to restore the window; never auto-restore, raise, or fall back to a wider scope.
 - If screen capture is blocked, explain the needed host-app OS permission; do not retry with broader scope.
 - Do not auto-install dependencies. See `references/dependencies.md` when an OS tool is missing.
 

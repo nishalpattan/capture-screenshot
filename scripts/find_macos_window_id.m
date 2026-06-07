@@ -20,6 +20,14 @@ static int layer_is_normal(CFDictionaryRef window) {
     return layer == 0;
 }
 
+/* A window is capturable only if it is currently drawn on a display. Minimized
+ * windows and windows on other Spaces report kCGWindowIsOnscreen == false and
+ * have no bitmap to capture. */
+static int window_is_onscreen(CFDictionaryRef window) {
+    CFBooleanRef onscreen_ref = CFDictionaryGetValue(window, kCGWindowIsOnscreen);
+    return onscreen_ref && CFBooleanGetValue(onscreen_ref);
+}
+
 static int window_number(CFDictionaryRef window, int *number) {
     CFNumberRef number_ref = CFDictionaryGetValue(window, kCGWindowNumber);
     return number_ref && CFNumberGetValue(number_ref, kCFNumberIntType, number);
@@ -53,7 +61,11 @@ int main(int argc, char **argv) {
         }
     }
 
-    CFArrayRef windows = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID);
+    /* Enumerate ALL windows (not just on-screen ones) so that a minimized or
+     * off-Space window that matches the query is still discovered. We classify
+     * each match with window_is_onscreen() below to decide whether it can be
+     * captured or whether to report it as present-but-not-capturable. */
+    CFArrayRef windows = CGWindowListCopyWindowInfo(kCGWindowListOptionAll, kCGNullWindowID);
     if (!windows) {
         if (query) {
             CFRelease(query);
@@ -61,8 +73,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    int found_count = 0;
-    int first_number = 0;
+    int capturable_count = 0;   /* matched, normal-layer, currently on-screen */
+    int present_count = 0;      /* matched and normal-layer, any on-screen state */
+    int first_capturable = 0;
     CFIndex count = CFArrayGetCount(windows);
     for (CFIndex i = 0; i < count; i++) {
         CFDictionaryRef window = CFArrayGetValueAtIndex(windows, i);
@@ -76,6 +89,11 @@ int main(int argc, char **argv) {
         }
 
         if (frontmost) {
+            /* The frontmost capturable window is the first on-screen, normal-layer
+             * window in front-to-back order; never return a minimized one. */
+            if (!window_is_onscreen(window)) {
+                continue;
+            }
             printf("%d\n", number);
             CFRelease(windows);
             if (query) {
@@ -90,12 +108,16 @@ int main(int argc, char **argv) {
             continue;
         }
 
+        present_count++;
+        if (!window_is_onscreen(window)) {
+            continue;   /* minimized or off-Space: present but not capturable */
+        }
         if (allow_multiple) {
             printf("%d\n", number);
         } else {
-            first_number = number;
+            first_capturable = number;
         }
-        found_count++;
+        capturable_count++;
     }
 
     CFRelease(windows);
@@ -103,16 +125,29 @@ int main(int argc, char **argv) {
         CFRelease(query);
     }
 
-    if (found_count == 0) {
+    if (frontmost) {
+        /* Reached only when no on-screen normal-layer window exists. */
         fprintf(stderr, "no matching on-screen window found\n");
         return 2;
     }
-    if (found_count > 1 && !allow_multiple) {
+
+    if (capturable_count == 0) {
+        if (present_count > 0) {
+            /* A window matched but is minimized or on another Space, so it has no
+             * bitmap to capture. CoreGraphics cannot reliably tell minimized from
+             * off-Space, so emit the conservative "unknown" reason token. */
+            fprintf(stderr, "unknown\n");
+            return 4;
+        }
+        fprintf(stderr, "no matching on-screen window found\n");
+        return 2;
+    }
+    if (capturable_count > 1 && !allow_multiple) {
         fprintf(stderr, "multiple matching windows found\n");
         return 3;
     }
     if (!allow_multiple) {
-        printf("%d\n", first_number);
+        printf("%d\n", first_capturable);
     }
     return 0;
 }

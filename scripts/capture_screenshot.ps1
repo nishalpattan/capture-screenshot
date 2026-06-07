@@ -45,6 +45,12 @@ public static class Win32Capture {
     [DllImport("user32.dll")]
     public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
 
+    [DllImport("user32.dll")]
+    public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsIconic(IntPtr hWnd);
+
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT {
         public int Left;
@@ -239,8 +245,55 @@ function Copy-Rectangle {
     }
 }
 
+function Copy-Window {
+    param([IntPtr]$Handle, [Drawing.Rectangle]$Bounds)
+    # Ask the window to render itself into our DC. Unlike CopyFromScreen (which
+    # grabs whatever pixels are on the screen at the rect), PrintWindow captures
+    # the window's own content even when it is occluded or in the background,
+    # without raising or stealing focus. PW_RENDERFULLCONTENT (0x2) is required
+    # for DWM/DirectX-composited windows.
+    $bitmap = [Drawing.Bitmap]::new($Bounds.Width, $Bounds.Height)
+    $graphics = [Drawing.Graphics]::FromImage($bitmap)
+    try {
+        $hdc = $graphics.GetHdc()
+        try {
+            $ok = [Win32Capture]::PrintWindow($Handle, $hdc, 0x2)
+        } finally {
+            $graphics.ReleaseHdc($hdc)
+        }
+        if (-not $ok) {
+            $bitmap.Dispose()
+            throw 'PrintWindow failed to capture the window'
+        }
+        return $bitmap
+    } finally {
+        $graphics.Dispose()
+    }
+}
+
+function Test-BitmapAllBlack {
+    # Some GPU/DirectX/Electron (e.g. Chrome) windows render black under
+    # PrintWindow. Sample a sparse grid so we can warn the user rather than
+    # silently saving a black image.
+    param([Drawing.Bitmap]$Bitmap)
+    if ($Bitmap.Width -le 0 -or $Bitmap.Height -le 0) {
+        return $true
+    }
+    $stepX = [Math]::Max(1, [int]($Bitmap.Width / 16))
+    $stepY = [Math]::Max(1, [int]($Bitmap.Height / 16))
+    for ($y = 0; $y -lt $Bitmap.Height; $y += $stepY) {
+        for ($x = 0; $x -lt $Bitmap.Width; $x += $stepX) {
+            $px = $Bitmap.GetPixel($x, $y)
+            if ($px.R -ne 0 -or $px.G -ne 0 -or $px.B -ne 0) {
+                return $false
+            }
+        }
+    }
+    return $true
+}
+
 function Capture-ToDestination {
-    param([Drawing.Rectangle]$Bounds, [string]$Label)
+    param([Drawing.Rectangle]$Bounds, [string]$Label, [IntPtr]$Handle = [IntPtr]::Zero)
     if ($DryRun) {
         if ($Destination -eq 'clipboard') {
             Write-Output 'clipboard'
@@ -250,7 +303,16 @@ function Capture-ToDestination {
         return
     }
 
-    $bitmap = Copy-Rectangle -Bounds $Bounds
+    if ($Handle -ne [IntPtr]::Zero) {
+        # Per-window capture: use PrintWindow so occluded/background windows
+        # capture their own content instead of whatever is drawn on top of them.
+        $bitmap = Copy-Window -Handle $Handle -Bounds $Bounds
+        if (Test-BitmapAllBlack -Bitmap $bitmap) {
+            [Console]::Error.WriteLine("warning: '$Label' rendered black via PrintWindow (GPU/Electron window); content may be unavailable without bringing it forward.")
+        }
+    } else {
+        $bitmap = Copy-Rectangle -Bounds $Bounds
+    }
     try {
         if ($Destination -eq 'clipboard') {
             [Windows.Forms.Clipboard]::SetImage($bitmap)
@@ -307,7 +369,11 @@ if ($Target -eq 'active') {
     if ($handle -eq [IntPtr]::Zero) {
         throw 'no active window found'
     }
-    Capture-ToDestination -Bounds (Get-WindowBounds -Handle $handle) -Label 'active-window'
+    if ([Win32Capture]::IsIconic($handle)) {
+        [Console]::Error.WriteLine("window_not_capturable: the active window is minimized — restore it and retry.")
+        exit 75
+    }
+    Capture-ToDestination -Bounds (Get-WindowBounds -Handle $handle) -Label 'active-window' -Handle $handle
     exit 0
 }
 
@@ -320,10 +386,17 @@ foreach ($queryText in $Query) {
     if ($handles.Count -eq 0) {
         throw 'no matching on-screen window found'
     }
-    if ($handles.Count -gt 1 -and -not $AllowMultipleMatches) {
+    # Minimized windows have no bitmap (PrintWindow returns black); drop them so a
+    # minimized duplicate cannot block a visible match, mirroring macOS/Linux.
+    $capturable = @($handles | Where-Object { -not [Win32Capture]::IsIconic($_) })
+    if ($capturable.Count -eq 0) {
+        [Console]::Error.WriteLine("window_not_capturable: '$queryText' is minimized — restore it and retry.")
+        exit 75
+    }
+    if ($capturable.Count -gt 1 -and -not $AllowMultipleMatches) {
         throw 'multiple matching windows found; ask for a more specific target'
     }
-    foreach ($handle in $handles) {
-        Capture-ToDestination -Bounds (Get-WindowBounds -Handle $handle) -Label $queryText
+    foreach ($handle in $capturable) {
+        Capture-ToDestination -Bounds (Get-WindowBounds -Handle $handle) -Label $queryText -Handle $handle
     }
 }

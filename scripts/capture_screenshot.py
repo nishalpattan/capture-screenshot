@@ -27,6 +27,7 @@ from typing import Iterable, Optional
 EXIT_USAGE = 64
 EXIT_PRIVACY = 73
 EXIT_UNAVAILABLE = 74
+EXIT_NOT_CAPTURABLE = 75  # named window exists but is minimized/off-screen
 
 
 @dataclasses.dataclass(frozen=True)
@@ -48,6 +49,12 @@ class CapturePlan:
 def die(message: str, code: int = 1) -> None:
     sys.stderr.write(f"{message}\n")
     raise SystemExit(code)
+
+
+def die_resolution(resolution: "ResolutionResult") -> None:
+    """Exit on a failed window resolution, choosing a meaningful exit code."""
+    code = EXIT_NOT_CAPTURABLE if resolution.code == "window_not_capturable" else EXIT_UNAVAILABLE
+    die(f"{resolution.code}: {resolution.message}", code)
 
 
 def validate_consent(consent_confirmed: bool) -> None:
@@ -127,29 +134,57 @@ def _matches(query: str, value: str | None) -> bool:
     return bool(value) and query.casefold() in value.casefold()
 
 
+def not_capturable_message(query: str, state: str = "unknown") -> str:
+    """Actionable message for a window that matched but cannot be captured.
+
+    Echoes only the user's query, never the real window title, to preserve the
+    privacy invariant. ``state`` is a best-effort hint from the OS helper.
+    """
+    if state == "minimized":
+        return f"'{query}' is minimized — restore it and retry."
+    if state == "offscreen":
+        return f"'{query}' is off-screen or on another Space — bring it forward and retry."
+    return f"'{query}' exists but cannot be captured (minimized or off-screen) — restore it and retry."
+
+
 def resolve_macos_window_ids(
     query: str,
     windows: list[dict[str, object]],
     allow_multiple: bool = False,
 ) -> ResolutionResult:
     matches: list[str] = []
+    capturable: list[str] = []
+    present_state = "unknown"
     for window in windows:
         owner = str(window.get("owner", ""))
         title = str(window.get("title", ""))
         window_id = window.get("id")
         if window_id is None:
             continue
-        if _matches(query, owner) or _matches(query, title):
-            matches.append(str(window_id))
+        if not (_matches(query, owner) or _matches(query, title)):
+            continue
+        matches.append(str(window_id))
+        # Fakes omit "capturable" (default True) to keep older tests valid; a
+        # window flagged not-capturable mirrors a minimized/off-screen window.
+        if window.get("capturable", True):
+            capturable.append(str(window_id))
+        else:
+            state = window.get("state")
+            if isinstance(state, str):
+                present_state = state
     if not matches:
         return ResolutionResult(False, "no_matching_window", "No matching on-screen window found.")
-    if len(matches) > 1 and not allow_multiple:
+    if not capturable:
+        return ResolutionResult(
+            False, "window_not_capturable", not_capturable_message(query, present_state)
+        )
+    if len(capturable) > 1 and not allow_multiple:
         return ResolutionResult(
             False,
             "multiple_matches",
             "Multiple matching windows found; ask for a more specific target.",
         )
-    return ResolutionResult(True, "ok", "ok", tuple(matches))
+    return ResolutionResult(True, "ok", "ok", tuple(capturable))
 
 
 def _tool(tools: Optional[dict[str, str]], name: str) -> Optional[str]:
@@ -276,6 +311,10 @@ def _test_windows() -> Optional[list[dict[str, object]]]:
             die("test window data must be a list of dicts", EXIT_USAGE)
         if "id" in entry and not isinstance(entry["id"], int):
             die("test window id must be an integer", EXIT_USAGE)
+        if "capturable" in entry and not isinstance(entry["capturable"], bool):
+            die("test window capturable must be a boolean", EXIT_USAGE)
+        if "state" in entry and not isinstance(entry["state"], str):
+            die("test window state must be a string", EXIT_USAGE)
     return parsed
 
 
@@ -312,7 +351,33 @@ def resolve_macos_with_helper(query: str, allow_multiple: bool, active: bool, sk
         return ResolutionResult(False, "no_matching_window", "No matching on-screen window found.")
     if proc.returncode == 3:
         return ResolutionResult(False, "multiple_matches", "Multiple matching windows found; ask for a more specific target.")
+    if proc.returncode == 4:
+        # The helper writes a bare reason token (minimized/offscreen/unknown) on
+        # its last stderr line; the title is never printed.
+        token = ""
+        if proc.stderr and proc.stderr.strip():
+            token = proc.stderr.strip().splitlines()[-1].strip()
+        return ResolutionResult(False, "window_not_capturable", not_capturable_message(query, token))
     return ResolutionResult(False, "window_query_failed", "Could not query the window list.")
+
+
+def _linux_window_is_viewable(window_id: str, tools: dict[str, str]) -> Optional[bool]:
+    """Best-effort map-state check for an X11 window.
+
+    Returns True if viewable (capturable), False if minimized/iconic/unmapped,
+    or None when neither xprop nor xwininfo is available to decide.
+    """
+    xprop = tools.get("xprop")
+    if xprop:
+        proc = subprocess.run([xprop, "-id", window_id, "WM_STATE"], capture_output=True, text=True)
+        if proc.returncode == 0 and "window state:" in proc.stdout.lower():
+            return "iconic" not in proc.stdout.lower()
+    xwininfo = tools.get("xwininfo")
+    if xwininfo:
+        proc = subprocess.run([xwininfo, "-id", window_id], capture_output=True, text=True)
+        if proc.returncode == 0 and "map state:" in proc.stdout.lower():
+            return "isviewable" in proc.stdout.lower().replace(" ", "")
+    return None
 
 
 def resolve_linux_named_window(query: str, allow_multiple: bool, tools: dict[str, str]) -> ResolutionResult:
@@ -329,9 +394,23 @@ def resolve_linux_named_window(query: str, allow_multiple: bool, tools: dict[str
     )
     if not ids:
         return ResolutionResult(False, "no_matching_window", "No matching on-screen window found.")
-    if len(ids) > 1 and not allow_multiple:
+
+    # Filter to viewable windows so a minimized duplicate cannot block a visible
+    # match. If map state cannot be determined (no xprop/xwininfo), keep every id
+    # and let the capture proceed as before.
+    classified = [(wid, _linux_window_is_viewable(wid, tools)) for wid in ids]
+    if any(state is None for _, state in classified):
+        capturable = ids
+    else:
+        capturable = tuple(wid for wid, state in classified if state)
+        if not capturable:
+            return ResolutionResult(
+                False, "window_not_capturable", not_capturable_message(query, "minimized")
+            )
+
+    if len(capturable) > 1 and not allow_multiple:
         return ResolutionResult(False, "multiple_matches", "Multiple matching windows found; ask for a more specific target.")
-    return ResolutionResult(True, "ok", "ok", ids)
+    return ResolutionResult(True, "ok", "ok", capturable)
 
 
 def prepare_output_paths(destination: str, output_root: Path, labels: list[str], create: bool = True) -> list[Path]:
@@ -493,7 +572,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.target == "window":
         if not args.query:
             die("window target requires at least one --query", EXIT_USAGE)
-        linux_window_tools = detect_tools(("xdotool", "import")) if platform_name == "Linux" else {}
+        linux_window_tools = (
+            detect_tools(("xdotool", "import", "xprop", "xwininfo")) if platform_name == "Linux" else {}
+        )
         for query in args.query:
             if platform_name == "Darwin":
                 resolution = resolve_macos_with_helper(query, args.allow_multiple_matches, False, skill_dir)
@@ -502,7 +583,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             else:
                 resolution = ResolutionResult(False, "unsupported_platform", f"unsupported platform: {platform_name}")
             if not resolution.ok:
-                die(f"{resolution.code}: {resolution.message}", EXIT_UNAVAILABLE)
+                die_resolution(resolution)
             window_ids.extend(resolution.ids)
             labels.extend([sanitize_label(query)] * len(resolution.ids))
     elif args.target == "active":
@@ -510,7 +591,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         if platform_name == "Darwin":
             resolution = resolve_macos_with_helper("", False, True, skill_dir)
             if not resolution.ok:
-                die(f"{resolution.code}: {resolution.message}", EXIT_UNAVAILABLE)
+                die_resolution(resolution)
             window_ids.extend(resolution.ids)
     else:
         labels = ["screen"]

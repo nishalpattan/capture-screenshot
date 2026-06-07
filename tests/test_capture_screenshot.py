@@ -118,6 +118,92 @@ class CaptureScreenshotUnitTests(unittest.TestCase):
         self.assertEqual(plan.code, "no_matching_window")
         self.assertFalse(plan.commands)
 
+    def test_macos_minimized_window_returns_not_capturable(self):
+        result = self.mod.resolve_macos_window_ids(
+            query="Notion Calendar",
+            windows=[
+                {"id": 10, "owner": "Notion Calendar", "title": "Secret Roadmap",
+                 "capturable": False, "state": "minimized"},
+            ],
+            allow_multiple=False,
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "window_not_capturable")
+        self.assertIn("Notion Calendar", result.message)
+        self.assertIn("minimized", result.message)
+        self.assertNotIn("Secret Roadmap", result.message)
+
+    def test_macos_offscreen_window_message_mentions_space(self):
+        result = self.mod.resolve_macos_window_ids(
+            query="Mail",
+            windows=[{"id": 7, "owner": "Mail", "title": "x", "capturable": False, "state": "offscreen"}],
+            allow_multiple=False,
+        )
+        self.assertEqual(result.code, "window_not_capturable")
+        self.assertIn("another Space", result.message)
+
+    def test_macos_mixed_matches_prefers_capturable_window(self):
+        result = self.mod.resolve_macos_window_ids(
+            query="Chrome",
+            windows=[
+                {"id": 1, "owner": "Chrome", "title": "a", "capturable": False, "state": "minimized"},
+                {"id": 2, "owner": "Chrome", "title": "b"},  # capturable defaults to True
+            ],
+            allow_multiple=False,
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.ids, ("2",))
+
+    def test_macos_minimized_cli_exits_not_capturable_without_leaking_title(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = Path(tmp) / "screenshots"
+            env = os.environ.copy()
+            env["CAPTURE_SCREENSHOT_TEST_PLATFORM"] = "Darwin"
+            env["CAPTURE_SCREENSHOT_TEST_WINDOWS"] = json.dumps(
+                [{"id": 30, "owner": "Notion Calendar", "title": "Secret Roadmap",
+                  "capturable": False, "state": "minimized"}]
+            )
+            proc = subprocess.run(
+                [sys.executable, str(SCRIPT), "--consent-confirmed", "--destination", "desktop",
+                 "--target", "window", "--query", "Notion Calendar",
+                 "--output-root", str(output_root), "--dry-run"],
+                capture_output=True, text=True, env=env,
+            )
+            self.assertEqual(proc.returncode, self.mod.EXIT_NOT_CAPTURABLE)
+            combined = proc.stdout + proc.stderr
+            self.assertIn("window_not_capturable", combined)
+            self.assertIn("minimized", combined)
+            self.assertNotIn("Secret Roadmap", combined)
+
+    def _write_fake_tool(self, path: Path, body: str) -> str:
+        path.write_text(f"#!/bin/sh\n{body}")
+        path.chmod(0o755)
+        return str(path)
+
+    def test_linux_minimized_window_returns_not_capturable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            tools = {
+                "xdotool": self._write_fake_tool(d / "xdotool", "echo 12345\n"),
+                "xprop": self._write_fake_tool(d / "xprop", 'echo "window state: Iconic"\n'),
+            }
+            result = self.mod.resolve_linux_named_window("Calculator", False, tools)
+            self.assertFalse(result.ok)
+            self.assertEqual(result.code, "window_not_capturable")
+            self.assertIn("Calculator", result.message)
+            self.assertIn("minimized", result.message)
+
+    def test_linux_viewable_window_passes_through(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            tools = {
+                "xdotool": self._write_fake_tool(d / "xdotool", "echo 12345\n"),
+                "xprop": self._write_fake_tool(d / "xprop", 'echo "window state: Normal"\n'),
+            }
+            result = self.mod.resolve_linux_named_window("Calculator", False, tools)
+            self.assertTrue(result.ok)
+            self.assertEqual(result.ids, ("12345",))
+
     def test_linux_wayland_missing_tools_fails_closed(self):
         plan = self.mod.plan_capture(
             platform_name="Linux",

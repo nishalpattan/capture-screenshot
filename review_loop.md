@@ -182,3 +182,105 @@ exit code for a condition that is actually a programming error (mismatched lists
 misinterpret this as a user-provided argument problem.
 _Suggested fix:_ Define a dedicated `EXIT_INTERNAL = 70` (sysexits.h EX_SOFTWARE)
 and use it for internal assertions.
+
+---
+
+## 2026-06-09
+
+### Security
+
+**[low] Windows `EnumWindows`/`GetWindowText` require no OS-level permission gate**
+`capture_screenshot.ps1:177–193` (`Find-WindowHandles`)
+On Windows, `EnumWindows` + `GetWindowText` enumerate all visible window titles
+without any OS consent prompt, special privilege, or permission toggle. This is
+distinct from the macOS model (noted as info on 2026-06-08), where
+`CGWindowListCopyWindowInfo` requires the Screen Recording permission. On Windows a
+shared-machine co-tenant could in principle observe that the skill is running a window
+title scan (e.g., via process handle or ETW), and the absence of an OS-level gate
+means there is no user-facing notice prior to the enumeration. The titles are never
+printed and are used only for query matching, so there is no direct data leak; the
+concern is the lack of an equivalent OS-enforced consent step.
+_Suggested fix:_ No code change is possible at the application layer (EnumWindows
+requires no privilege). Document in SKILL.md that Windows window title enumeration has
+no OS gate, so the skill's own consent check (`-ConsentConfirmed`) is the only guard
+on Windows.
+
+---
+
+### Bugs & regressions
+
+**[medium] Uncaught `CalledProcessError` if `clang` compilation of the macOS helper fails**
+`capture_screenshot.py:resolve_macos_with_helper` (~line 335)
+```python
+subprocess.run([clang, "-framework", "ApplicationServices", str(helper_source), "-o", str(helper)], check=True)
+```
+If `clang` is available on `$PATH` (so the `shutil.which` check passes) but compilation
+fails — for example because Xcode Command Line Tools are installed but the
+ApplicationServices framework header is missing, or because the SDK path is wrong —
+`subprocess.run(..., check=True)` raises `subprocess.CalledProcessError`. This
+exception is not caught anywhere in `resolve_macos_with_helper` or `main()`, so the
+process exits with an unhandled traceback rather than a structured
+`ResolutionResult(False, …)` and a clean error message.
+_Suggested fix:_ Wrap the clang invocation in a `try/except subprocess.CalledProcessError`
+and return `ResolutionResult(False, "helper_compile_failed", "Could not compile macOS
+window helper — check that Xcode Command Line Tools are fully installed.")`.
+
+**[low] PS dry-run mode can return duplicate paths when multiple windows share a label**
+`capture_screenshot.ps1:104–119` (`New-CapturePath`)
+`New-CapturePath` determines uniqueness by checking `Test-Path` on the filesystem.
+In `--dry-run --allow-multiple-matches` mode, no files are written to disk, so every
+call for the same label returns the same candidate path (e.g., `chrome.png`). If two
+windows match the same query, `Capture-ToDestination` prints the same path twice. The
+Python version avoids this with an in-memory `reserved` set passed between calls.
+_Suggested fix:_ Introduce a script-level `$script:ReservedPaths` hash set (e.g.,
+`[System.Collections.Generic.HashSet[string]]::new()`) and consult it in
+`New-CapturePath` alongside `Test-Path`, mirroring `unique_capture_path`'s `reserved`
+parameter.
+
+**[low] PS `throw` statements exit with code 1 rather than structured exit codes**
+`capture_screenshot.ps1` (multiple `throw` sites)
+Several error conditions — missing query for window target, no matching window found,
+multiple matching windows, and PowerShell internal errors — are raised with `throw`,
+which causes the script to exit with code 1. Only the two `exit 75`
+(`window_not_capturable`) and `exit 0` paths use structured codes. The Python
+orchestrator's callers may check the exit code for routing (e.g., distinguishing
+`EXIT_USAGE=64` from `EXIT_UNAVAILABLE=74`); any error that falls through `throw`
+returns 1 instead, inconsistent with the documented code table.
+_Suggested fix:_ Replace `throw` with `[Console]::Error.WriteLine(…); exit <code>`
+for each structured error case, matching the exit codes defined in the Python script
+(`EXIT_USAGE=64`, `EXIT_UNAVAILABLE=74`).
+
+---
+
+### Data leaks
+
+No new findings. Window titles continue to be confined to in-process memory on all
+platforms. The PS `Test-BitmapAllBlack` warning message includes `$Label` (the
+user-supplied query text, not a window title), which is acceptable. The `throw`
+messages include the user's query text (e.g., the needle in `Find-WindowHandles`) but
+never window titles retrieved via `GetWindowText`.
+
+---
+
+### UX
+
+**[low] macOS helper binary is recompiled with `clang` on every named-window request**
+`capture_screenshot.py:resolve_macos_with_helper` (~line 325–342)
+`find_macos_window_id` is compiled from source into a fresh `TemporaryDirectory` on
+each invocation of `--target window` or `--target active` on macOS. `clang`
+compilation adds roughly 0.5–1 s of latency to every such request. The compiled binary
+is discarded when the context manager exits and rebuilt the next time.
+_Suggested fix:_ Cache the compiled binary alongside the source (e.g., in
+`skill_dir/scripts/.cache/find_macos_window_id`) keyed on the source's `mtime` or
+hash, and only recompile when the source changes. Fall back to recompile if the cache
+is stale or missing.
+
+**[info] `Test-BitmapAllBlack` sparse-grid sampling may miss narrow non-black content**
+`capture_screenshot.ps1:Test-BitmapAllBlack` (~line 220–237)
+The GPU/Electron black-capture warning samples one pixel every `width/16` columns and
+`height/16` rows. On a 1920×1080 window, columns are sampled every 120 pixels, meaning
+a 119-pixel-wide stripe of non-black content between two sample columns is invisible to
+the check. The warning is advisory-only and does not block the save, so this is
+cosmetic; the user sees no warning but still receives the (mostly-black) PNG. No fix
+is required, but a note in code comments that the check is a coarse heuristic would
+avoid misreading the function as exhaustive.

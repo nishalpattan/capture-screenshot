@@ -284,3 +284,103 @@ the check. The warning is advisory-only and does not block the save, so this is
 cosmetic; the user sees no warning but still receives the (mostly-black) PNG. No fix
 is required, but a note in code comments that the check is a coarse heuristic would
 avoid misreading the function as exhaustive.
+
+---
+
+## 2026-06-10
+
+### Security
+
+**[low] `_test_windows()` does not catch `json.JSONDecodeError` on malformed input**
+`capture_screenshot.py:308`
+```python
+parsed = json.loads(raw)
+```
+If `CAPTURE_SCREENSHOT_TEST_WINDOWS` contains malformed JSON, `json.loads` raises
+`json.JSONDecodeError`, which propagates as an unhandled exception with a raw Python
+traceback rather than a clean `die()` message. This variable is only active in test/debug
+scenarios, so production risk is minimal, but the failure mode is inconsistent with
+every other validation path in the module.
+_Suggested fix:_ Wrap in `try/except json.JSONDecodeError` and call
+`die("CAPTURE_SCREENSHOT_TEST_WINDOWS is not valid JSON: ...", EXIT_USAGE)`.
+
+---
+
+### Bugs & regressions
+
+**[high] Linux X11 named-window clipboard capture always crashes with "internal error: missing output path"**
+`capture_screenshot.py:288–296` (`plan_capture`) and `capture_screenshot.py:499–502` (`execute_plan`)
+When `--target window --destination clipboard` is used on Linux X11 with `xdotool` and
+`import` available, `plan_capture` returns commands containing `"{output}"` placeholders
+for every window ID:
+```python
+commands = tuple((import_cmd, "-window", str(window_id), "{output}") for window_id in window_ids)
+```
+The `"{output}"` placeholder signals a desktop-bound path. In `execute_plan`, the
+clipboard branch at line 499 calls `run_command(command)` without an `output` argument.
+`run_command` immediately dies with "internal error: missing output path" (exit 64) when
+it encounters `"{output}"` in the command with `output=None`. The Wayland path is
+correctly rejected earlier (`unsupported_wayland_window_capture`), but the X11 path is
+not guarded. The user receives an opaque internal error rather than a working capture or
+a clean "not supported" message.
+_Suggested fix:_ Either (a) return a `CapturePlan(False, "unsupported_linux_x11_window_clipboard", …)`
+for this combination explicitly in `plan_capture`, or (b) use `"{temp-output}"` and pipe
+to `xclip`/`xsel` by adding those to the plan (mirroring the grim+wl-copy path), plus a
+`copy_file_to_clipboard` call in `execute_plan`.
+
+**[medium] `xsel` clipboard backend sets no MIME type on clipboard content**
+`capture_screenshot.py:475–476`
+```python
+elif name == "xsel":
+    subprocess.run([tool, "--clipboard", "--input"], input=data, check=True)
+```
+When `xsel` is the clipboard tool (the fallback when `xclip` is absent),
+`copy_file_to_clipboard` writes raw PNG bytes to the clipboard without specifying a MIME
+type. `xclip` uses `-t image/png` and `wl-copy` uses `--type image/png`; `xsel` has no
+equivalent flag. Most graphical applications (browsers, office suites, image editors)
+look for a typed `image/png` selection target and will fail to paste or will paste as
+raw binary. The capture appears to succeed (exit 0, "clipboard" printed) but the result
+is not usable.
+_Suggested fix:_ Prefer `xclip` over `xsel` in `plan_capture` (already done:
+`clip = xclip or xsel`), and add a warning when `xsel` is selected that paste
+compatibility may be limited. Long-term, replace `xsel` in the clipboard path with a
+`xclip`-only requirement or with `wl-copy` on Wayland.
+
+**[low] `install.sh` does not guard against an unset or empty `$HOME`**
+`install.sh:36,41,47`
+All three agent skill paths are constructed as `"$HOME/.claude/skills"`, `"$HOME/.codex/skills"`,
+and `"$HOME/.config/opencode/skills"`. If `$HOME` is unset (unusual but possible in
+restricted or CI environments), these expand to `"/.claude/skills"`, `"/.codex/skills"`,
+and `"/.config/opencode/skills"`. A stray `[ -d "/.claude/skills" ]` that returns
+true (e.g., on a container image that pre-populates that path) would cause
+`clone_if_missing` to attempt `git clone "$REPO" "/.claude/skills/capture-screenshot"`,
+writing into a system-owned directory and likely failing with a permission error or,
+worse, succeeding if run as root.
+_Suggested fix:_ Add `[ -z "$HOME" ] && { echo "error: \$HOME is not set"; exit 1; }` near
+the top of the script, before the first path check.
+
+---
+
+### Data leaks
+
+No new findings. Window title isolation continues to hold across all platforms:
+- Linux X11 crash path (above) emits only the static string "internal error: missing
+  output path" — no window title is exposed in the error.
+- `xsel` clipboard bug writes raw PNG bytes, not metadata derived from window titles.
+- All error messages in `find_macos_window_id.m` continue to emit only static strings or
+  the `unknown`/`minimized` reason token with no title content.
+
+---
+
+### UX
+
+**[medium] Linux X11 named-window clipboard capture surfaces an opaque internal error**
+`capture_screenshot.py:499–502`
+(Same root cause as the high-severity bug above.) A user running
+`capture_screenshot.py --target window --destination clipboard --query Firefox` on Linux
+X11 receives exit code 64 and the message "internal error: missing output path" — which
+gives no hint that clipboard capture of named windows is unsupported on this platform.
+The macOS and Wayland paths return structured, actionable codes; X11 clipboard/window
+should do the same.
+_Suggested fix:_ Same as the bug entry above — return a structured `CapturePlan(False, …)`
+rather than letting the internal placeholder mismatch surface to the user.

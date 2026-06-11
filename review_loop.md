@@ -7,6 +7,127 @@ Severity levels: **critical** / **high** / **medium** / **low** / **info**
 
 ---
 
+## 2026-06-11
+
+### Security
+
+**[low] `find_macos_window_id.m` stores `CGWindowID` in a signed `int`, not `uint32_t`**
+`scripts/find_macos_window_id.m:33,97`
+`CGWindowID` is a `uint32_t`. The `window_number` helper casts it into an `int *` and
+calls `CFNumberGetValue(..., kCFNumberIntType, number)`, which uses a 32-bit signed
+read. If a window number exceeds INT_MAX (~2.1 billion), the stored value is negative.
+`printf("%d\n", number)` then prints a negative decimal string, which `_validate_integer_ids`
+rejects via `.isdigit()` (leading `-` fails the test), causing an `EXIT_USAGE` error
+instead of returning the window ID. In practice macOS assigns sequential IDs that rarely
+approach INT_MAX in normal use, making this theoretical, but the mismatch between
+`CGWindowID` (unsigned) and `int` (signed) is a latent correctness defect.
+_Suggested fix:_ Declare `number` and `first_capturable` as `unsigned int`, change the
+`CFNumberGetValue` call to `kCFNumberSInt32Type` (or use `kCGWindowNumber` directly
+with `CGWindowID`), and print with `"%u\n"`.
+
+---
+
+### Bugs & regressions
+
+**[medium] `run_command(check=True)` propagates `CalledProcessError` as an unhandled traceback on any tool failure**
+`capture_screenshot.py:465` and callers in `execute_plan`
+All screenshot-tool invocations inside `execute_plan` call `run_command` which ends
+with `subprocess.run(args, check=True)`. If a tool exits non-zero — e.g., `screencapture`
+fails because Screen Recording permission was revoked mid-session, `gnome-screenshot`
+returns an error, or `grim` cannot connect to the Wayland compositor — Python raises
+`subprocess.CalledProcessError`. This exception is not caught anywhere in `run_command`,
+`execute_plan`, or `main`, so the process exits with a raw Python traceback and an
+implicit exit code of 1 rather than a structured `die()` message and a documented exit
+code. The 2026-06-09 entry noted this specifically for the `clang` compile step; the
+same gap applies to every screenshot tool call at runtime.
+_Suggested fix:_ Catch `subprocess.CalledProcessError` in `run_command` (or in
+`execute_plan` around the `run_command` call) and call
+`die(f"capture tool failed (exit {e.returncode}): {e.cmd[0]}", EXIT_UNAVAILABLE)`,
+preserving the structured error-message and exit-code contract for all tool failures.
+
+**[medium] macOS `--allow-multiple-matches` + `--destination clipboard` silently discards all captures except the last**
+`capture_screenshot.py:225–231` and `execute_plan:499–502`
+When multiple window IDs match a query on macOS with `--allow-multiple-matches
+--destination clipboard`, `plan_capture` builds one `screencapture -x -l <id> -c`
+command per window. In `execute_plan`, each command is executed in order; each
+successive `screencapture -c` overwrites the clipboard. Only the last-matched window's
+image survives. The function prints a single `"clipboard"` regardless of how many
+windows were captured, giving no indication which window is on the clipboard or that
+earlier captures were silently discarded.
+_Suggested fix:_ Either (a) return `CapturePlan(False, "clipboard_allows_one",
+"clipboard destination supports only one window at a time; use desktop for multiple
+captures")` when `destination == "clipboard"` and `len(window_ids) > 1`, or (b)
+document the last-wins behavior and print a warning to stderr listing how many
+captures were requested vs. written to the clipboard.
+
+**[medium] Linux fullscreen + Wayland + clipboard falls through to `import -window root` which fails at runtime on pure Wayland**
+`capture_screenshot.py:258–260`
+When `--target fullscreen --destination clipboard` is requested on a Wayland session
+and neither `gnome-screenshot` nor `grim` is installed, but ImageMagick `import` and
+`xclip`/`xsel` are present, `plan_capture` returns a plan with
+`(import_cmd, "-window", "root", "{temp-output}")`. At runtime, `import -window root`
+connects to the X11 DISPLAY. On a pure Wayland system with no XWayland active, this
+call fails with a non-zero exit status, which (see finding above) surfaces as an
+unhandled `CalledProcessError` traceback rather than a clean unsupported message. The
+session-type guard for Wayland only blocks the `window` target, not the `fullscreen`
+clipboard path.
+_Suggested fix:_ When `session == "wayland"`, skip the `import`+xclip/xsel branch for
+fullscreen clipboard (since `import` is inherently X11). Return
+`CapturePlan(False, "missing_dependency_fullscreen", …)` without the `import` option,
+matching the Wayland-aware behaviour of the `window` target.
+
+**[low] Windows `Find-WindowHandles` does not guard against zero-size visible windows**
+`capture_screenshot.ps1:181–219` (`Find-WindowHandles`), `Get-WindowBounds:222–234`
+`Find-WindowHandles` retains any handle that passes `IsWindowVisible` and matches the
+query by title or process name. Windows that are visible but have zero or negative
+dimensions (e.g., certain shell-notification or hidden-tray windows) pass this filter.
+When `Get-WindowBounds` is later called for such a handle it throws "window has no
+drawable bounds", which exits with code 1 via `throw` rather than a structured error
+code, and blocks any remaining handles from being processed in the loop.
+_Suggested fix:_ In `Get-WindowBounds` or at the call site in the `foreach` loop,
+catch the zero-bounds case and either skip the handle with a stderr warning or return
+a `CapturePlan`-equivalent error with exit 74 (unavailable).
+
+---
+
+### Data leaks
+
+No new findings. The CalledProcessError tracebacks discussed above include only the
+tool path and exit code in the `CalledProcessError` message; command arguments contain
+temp-file paths and integer window IDs but no window titles. The multi-clipboard
+overwrite bug involves only captured pixel data, not metadata from window titles.
+
+---
+
+### UX
+
+**[low] No timeout on screenshot-tool subprocess calls; a hung tool blocks indefinitely**
+`capture_screenshot.py:465` (`subprocess.run(args, check=True)`)
+`run_command` and the `clang` compile step in `resolve_macos_with_helper` use
+`subprocess.run` without a `timeout` parameter. A tool that hangs — e.g.,
+`gnome-screenshot` waiting on a D-Bus response, `screencapture` blocked by a macOS
+permission dialog, or `clang` hitting a system resource limit — will block the Python
+process indefinitely. In agent integrations this freezes the calling agent with no
+feedback or timeout signal.
+_Suggested fix:_ Pass a reasonable `timeout` (e.g., 30 s for screenshot tools, 60 s
+for the clang compile) to each `subprocess.run` call, catching `subprocess.TimeoutExpired`
+and calling `die("capture timed out — tool did not complete in time", EXIT_UNAVAILABLE)`.
+
+**[info] CapturePlan clipboard commands include dead arguments beyond index [0]**
+`capture_screenshot.py:256,258–260`
+The `CapturePlan` commands for the two-step clipboard paths include trailing arguments
+on the second command (e.g., `(wl_copy, "--type", "image/png")` and `(clip,)`). In
+`execute_plan`, only `plan.commands[1][0]` is used (the tool path); the remaining
+elements are silently discarded and the correct arguments are re-applied inside
+`copy_file_to_clipboard`. A reader of `plan_capture` may incorrectly believe these
+arguments are passed to the clipboard tool by the general `run_command` path.
+_Suggested fix:_ Normalise the second command to just `(wl_copy,)` and `(clip,)`,
+matching what `execute_plan` actually consumes; or add a comment explaining that args
+beyond `[0]` are intentionally unused and the tool logic lives in
+`copy_file_to_clipboard`.
+
+---
+
 ## 2026-06-08
 
 ### Security

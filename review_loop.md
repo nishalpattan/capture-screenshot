@@ -505,3 +505,104 @@ The macOS and Wayland paths return structured, actionable codes; X11 clipboard/w
 should do the same.
 _Suggested fix:_ Same as the bug entry above — return a structured `CapturePlan(False, …)`
 rather than letting the internal placeholder mismatch surface to the user.
+
+---
+
+## 2026-06-12
+
+### Security
+
+**[low] PowerShell `$matches` variable name collides with the automatic regex variable**
+`capture_screenshot.ps1:204`
+`Find-WindowHandles` assigns `$matches = [System.Collections.Generic.List[IntPtr]]::new()`,
+shadowing PowerShell's built-in automatic variable `$Matches` (populated after `-match` and
+`Select-String` operations). No regex operations currently occur in this function, so there
+is no runtime bug, but PSScriptAnalyzer raises `PSAvoidAssignmentToAutomaticVariable` for this
+assignment. A future maintainer who adds a `-match` expression inside `Find-WindowHandles`
+would find `$matches` already holding the `List[IntPtr]` instead of the regex capture groups,
+producing a hard-to-diagnose failure.
+_Suggested fix:_ Rename `$matches` to `$matchedHandles` (or similar) throughout
+`Find-WindowHandles`.
+
+**[low] `install.sh` does not verify `git` is available before invoking `git clone`**
+`install.sh:27`
+`clone_if_missing` calls `git clone` without first checking that `git` exists in `PATH`. On a
+system where git is absent, execution fails with `git: command not found` after the installer
+has already printed the banner and detected agent directories, producing a confusing mid-run
+failure with no clear remediation message. In a container image where `/.claude/skills` happens
+to exist (e.g., a pre-built image) and the process runs as root, a missing git binary that is
+later installed by a setup hook could introduce a window where the check passes but git is
+absent.
+_Suggested fix:_ Add `command -v git >/dev/null 2>&1 || { echo "error: git is required but not
+found in PATH"; exit 1; }` near the top of the script, before the first agent-detection block.
+
+---
+
+### Bugs & regressions
+
+**[low] `execute_plan` clipboard `{temp-output}` dispatch is silently broken for any plan that uses `{temp-output}` in a non-two-command sequence**
+`capture_screenshot.py:491`
+The branch that routes clipboard captures through a temp file checks:
+```python
+if destination == "clipboard" and len(plan.commands) == 2 and "{temp-output}" in plan.commands[0]:
+```
+The `len(plan.commands) == 2` guard is an undocumented implicit contract between `plan_capture`
+and `execute_plan`. If a future `plan_capture` path adds a single-command or three-command plan
+containing `{temp-output}`, the condition is False and execution falls through to the standard
+clipboard branch (line 499), which calls `run_command(command)` without a `temp_output` argument.
+`run_command` then immediately dies with "internal error: missing temporary output path" (exit 64).
+The failure is silent at plan construction time and only surfaces at runtime. This is structurally
+related to the 2026-06-11 finding about dead args beyond `commands[1][0]` in clipboard plans; both
+stem from the implicit two-command contract.
+_Suggested fix:_ Replace the `len == 2` guard with `any("{temp-output}" in cmd for cmd in
+plan.commands)` so the dispatch is robust to command count. Add a comment documenting the
+two-step `capture → copy-to-clipboard` structure and why `commands[1][0]` is the only element
+consumed from the second command.
+
+**[info] `plan_capture` re-reads `XDG_SESSION_TYPE` from the environment when `session_type` is the empty string**
+`capture_screenshot.py:234`
+```python
+session = (session_type or os.environ.get("XDG_SESSION_TYPE") or "").lower()
+```
+`main()` passes `os.environ.get("XDG_SESSION_TYPE")` (line 631), which returns `None` when the
+variable is absent (not `""`), so the double-read is harmless in the common case. However, if
+`XDG_SESSION_TYPE` is exported as an empty string in the environment, `main()` passes `""` to
+`plan_capture`, which evaluates as falsy and falls through to `os.environ.get` again — reading
+the same empty string. The API creates a subtle ambiguity: callers cannot explicitly pass "no
+session type override" because `""` is indistinguishable from `None` as a signal to fall back to
+the environment.
+_Suggested fix:_ Use `session_type if session_type is not None else os.environ.get("XDG_SESSION_TYPE", "")`
+in `plan_capture`, treating `None` as "read from environment" and `""` as an explicit "unset" override.
+
+---
+
+### Data leaks
+
+No new findings. Window title isolation continues to hold across all reviewed code paths. The
+`$matches` naming issue involves window handle integers (IntPtr), not titles. The `install.sh`
+git-availability failure exposes no user data. All error messages in all three platform paths
+continue to echo only the user-supplied query text, never real window titles retrieved from the OS.
+
+---
+
+### UX
+
+**[low] Windows: `PrintWindow` black-image detection warns but does not fall back to `CopyFromScreen`**
+`capture_screenshot.ps1:306–314`
+When `Test-BitmapAllBlack` detects that `PrintWindow` returned an all-black bitmap (the known
+failure mode for GPU/DirectX/Electron windows such as Chrome), `Capture-ToDestination` writes the
+warning to stderr but still saves and returns the black PNG. Since the user explicitly named (or
+brought forward) the target window, it is typically unoccluded and suitable for a screen-buffer
+blit via `CopyFromScreen`. An automatic silent fallback to `Copy-Rectangle` would deliver a
+usable screenshot instead of a guaranteed-useless black image. The current behaviour forces the
+user to bring the window forward, try again, and is not documented in the error message.
+_Suggested fix:_ After detecting an all-black `PrintWindow` result, retry via `Copy-Rectangle`
+and use that bitmap instead. Log a single debug-level warning (e.g., to stderr if `-Verbose` is
+active) that a CopyFromScreen fallback was used.
+
+**[low] `install.sh` provides no early-exit message when `git` is unavailable**
+`install.sh:27`
+(Same root cause as the Security finding above.) On a git-free system the user sees the installer
+banner, agent detection output, and then an OS error for each `clone_if_missing` invocation,
+rather than a single actionable "git is required" message before any output.
+_Suggested fix:_ Same as the Security entry above.

@@ -508,6 +508,143 @@ rather than letting the internal placeholder mismatch surface to the user.
 
 ---
 
+## 2026-06-13
+
+### Security
+
+**[medium] Empty `--query ""` matches every visible window on all three platforms**
+`capture_screenshot.py:580–594`, `capture_screenshot.ps1:384–401`, `find_macos_window_id.m:107`
+`parse_args` and the per-platform window resolution functions accept an empty string as a
+valid query value. The `--target window` guard at line 580 only checks `if not args.query`
+(list is non-empty); it does not reject elements that are empty strings. On Linux, xdotool
+`search --name ""` matches all windows with a non-empty title. On macOS, `CFStringFind`
+with an empty-string needle always returns a match (`range.location != kCFNotFound`), so
+the C helper classifies every normal-layer window as a hit. On Windows,
+`String.IndexOf("", OrdinalIgnoreCase)` returns 0 (≥ 0 = match), causing
+`Find-WindowHandles` to collect every visible window. With `--allow-multiple-matches`, all
+visible windows are captured, silently breaking the privacy guarantee that the capture scope
+is never wider than the user's named target. Without that flag the result is either a
+"multiple matches" error (harmless) or, on a single-window desktop, capture of the one
+remaining window (not the intended target).
+_Suggested fix:_ Add a validation step — in `parse_args` or at the start of the window
+resolution functions — that rejects any empty-string query element with `die("--query must
+not be empty", EXIT_USAGE)`. Add a corresponding test.
+
+**[medium] `agents/openai.yaml` sets `allow_implicit_invocation: true`**
+`agents/openai.yaml:7`
+The OpenAI agent YAML policy enables implicit invocation, meaning the capture-screenshot
+skill can be selected by the model without an explicit user request. In an agentic pipeline
+where the model independently decides to capture a screenshot, the consent gate provided by
+`--consent-confirmed` / `-ConsentConfirmed` could be satisfied programmatically without a
+visible user approval step. This partially undermines the consent enforcement described in
+SKILL.md ("Before any capture, ask the user to approve the exact scope"). The SKILL.md
+instructions apply to a human-in-the-loop workflow; `allow_implicit_invocation` relaxes
+that assumption.
+_Suggested fix:_ Either set `allow_implicit_invocation: false` to require explicit user
+invocation, or document in SKILL.md and the YAML file why implicit invocation is safe (e.g.,
+if the model is still required to prompt for `--consent-confirmed` before executing the
+command).
+
+**[low] TOCTOU between `output.exists()` check and `os.replace()` in `execute_plan`**
+`capture_screenshot.py:512–514`
+```python
+if output.exists() or output.is_symlink():
+    die("refusing to overwrite an existing screenshot path", EXIT_PRIVACY)
+os.replace(temp_output, output)
+```
+Between the existence check and the `os.replace` call, a local attacker or concurrent
+process could create a symbolic link at `output`. `os.replace()` on Linux atomically
+replaces the target of a symlink (i.e., it follows the link and overwrites the pointed-to
+file) rather than replacing the symlink itself. This could cause the screenshot to be
+written to an attacker-controlled path. Note: this is distinct from the 2026-06-08 finding,
+which covers the TOCTOU in `ensure_private_directory` between `is_symlink()` and `mkdir`.
+_Suggested fix:_ On Linux, use `os.open` with `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW`
+to create the final file atomically without following symlinks, then write temp content
+into it; or verify post-replace that `output` is not a symlink.
+
+---
+
+### Bugs & regressions
+
+**[medium] Windows DPI scaling causes incorrect capture bounds for active and named-window targets**
+`capture_screenshot.ps1:226–234` (`Get-WindowBounds`), `capture_screenshot.ps1:239–246` (`Copy-Rectangle`)
+`GetWindowRect` returns window coordinates in logical (DPI-unscaled) pixels. In .NET's
+GDI+ layer, `Graphics.CopyFromScreen` operates in device (physical) pixels as reported by
+the DC. On displays with display scaling (e.g., 150% or 200% DPI), logical and physical
+coordinate spaces diverge: a window whose logical rect is (0, 0, 960, 540) occupies
+(0, 0, 1440, 810) in physical pixels. `Copy-Rectangle` constructs a `Drawing.Bitmap` with
+the logical dimensions and blits the physical-pixel region, resulting in a capture that is
+undersized (missing the right/bottom portion of the window) or misaligned. `PrintWindow`
+(used in `Copy-Window`) is unaffected because it renders into the DC at the window's own
+resolution. The issue affects `--target active` and `--target fullscreen` on scaled
+displays.
+_Suggested fix:_ Retrieve the DPI scale factor (via `Graphics.DpiX / 96.0`) and multiply
+the logical rect dimensions before allocating the bitmap and calling `CopyFromScreen`, or
+set the PowerShell process to be Per-Monitor DPI aware via a manifest / `SetProcessDpiAwareness`.
+
+**[low] `Copy-Rectangle` fails or produces a wrapped capture when a window has negative screen coordinates**
+`capture_screenshot.ps1:239–246` (`Copy-Rectangle`)
+On multi-monitor systems where the primary monitor is not the leftmost display, windows
+positioned on monitors to the left of the primary have negative `.Left` or `.Top`
+coordinates in `GetWindowRect`. `Graphics.CopyFromScreen` with negative source coordinates
+is undefined in some .NET implementations and may throw, silently wrap the coordinates to
+zero, or produce an incorrectly offset capture. This affects `--target active` and named
+`--target window` captures on such configurations.
+_Suggested fix:_ Guard against negative bounds by clamping to the virtual screen rectangle
+(`[Windows.Forms.SystemInformation]::VirtualScreen`) or by catching exceptions from
+`CopyFromScreen` and reporting `window_not_capturable` with a descriptive message about
+the off-screen position.
+
+**[low] PowerShell temp file uses a dot-prefix (hidden attribute), inconsistent with Python's documented avoidance**
+`capture_screenshot.ps1:163` vs `capture_screenshot.py:437–439`
+`New-TemporaryCapturePath` names the temp file `.{stem}.{PID}.{index}.tmp.png`
+(dot-prefix). The Python path explicitly avoids dot-prefixes because macOS `screencapture`
+refuses to write to hidden files, and includes a comment explaining this. While Windows has
+no such restriction, some endpoint-security and backup agents skip hidden files (files with
+the dot-prefix or the Hidden attribute). A screenshot capture that fails between writing the
+temp file and the `Move-Item` would leave a hidden residual file not visible in Explorer.
+The `finally` cleanup block does handle this case, so data exposure risk is low, but the
+inconsistency between platforms is a latent maintenance hazard.
+_Suggested fix:_ Name the temp file without a leading dot, e.g.,
+`'{0}.{1}.{2:D3}.tmp.png' -f $stem, $PID, $i`, consistent with the Python version.
+
+---
+
+### Data leaks
+
+No new findings. The empty-query bug (Security above) would result in captures of
+unintended windows, but the output path and filenames are still derived from the
+sanitized query (empty → "capture") rather than actual window titles. The DPI and
+negative-coordinate issues involve pixel data, not metadata. The `allow_implicit_invocation`
+concern is about consent process, not title leakage. All previously documented title-privacy
+invariants continue to hold in the reviewed code.
+
+---
+
+### UX
+
+**[low] No test coverage for empty `--query ""` validation**
+`tests/test_capture_screenshot.py`
+The test suite has no test that passes `--query ""` (or `--query` with an empty string)
+and asserts an early exit with `EXIT_USAGE`. Given that the empty-query issue silently
+expands capture scope (see Security above), a targeted regression test is warranted.
+_Suggested fix:_ Add a test that calls `parse_args` or runs the script subprocess with
+`--target window --query ""` and asserts `EXIT_USAGE` (exit code 64) and a message
+containing "must not be empty".
+
+**[info] `allow_implicit_invocation: true` in `agents/openai.yaml` is not mentioned in SKILL.md**
+`agents/openai.yaml:7`, `SKILL.md`
+SKILL.md's "Required Workflow" section instructs the agent to ask the user for approval
+before each capture. The `allow_implicit_invocation: true` policy in the OpenAI YAML
+could allow the skill to be selected without the user explicitly typing a capture request,
+which is not discussed in SKILL.md. A user unfamiliar with this YAML knob might assume
+explicit invocation is always required.
+_Suggested fix:_ Add a note to SKILL.md (or to the YAML file itself) explaining the
+implicit-invocation policy and confirming that the consent guard still applies even when
+the skill is invoked implicitly.
+
+---
+
 ## 2026-06-12
 
 ### Security

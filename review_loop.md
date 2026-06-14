@@ -743,3 +743,64 @@ active) that a CopyFromScreen fallback was used.
 banner, agent detection output, and then an OS error for each `clone_if_missing` invocation,
 rather than a single actionable "git is required" message before any output.
 _Suggested fix:_ Same as the Security entry above.
+
+---
+
+## 2026-06-14
+
+### Security
+
+**[medium] README documents `curl | bash` as the primary install method, creating a supply-chain trust gap**
+`README.md:15`
+```bash
+curl -fsSL https://raw.githubusercontent.com/nishalpattan/capture-screenshot/main/install.sh | bash
+```
+This pattern downloads and immediately executes the script without giving the user any opportunity to review it. If the GitHub repository or CDN is compromised (account takeover, malicious PR merged, CDN cache poisoning), or if the network path is under active attack (HTTPS mitigates most scenarios but not a compromised CA), arbitrary code runs on the user's machine. Unlike the 2026-06-08 "HTTPS transport for repository integrity" info finding (which covers cloned history), this finding is about the single-command install UX — users typically run it without auditing the script first. The script itself is short and auditable (63 lines, only `git clone`), which limits actual blast radius, but the pattern itself is the concern.
+_Suggested fix:_ Add a two-step form to the README: `curl -fsSL ... > install.sh && cat install.sh` (review) then `bash install.sh` (run). Alternatively, publish a SHA-256 checksum alongside each release and document a `shasum -c` verification step.
+
+**[low] macOS helper binary compiled without explicit hardening flags**
+`capture_screenshot.py:339`
+```python
+subprocess.run([clang, "-framework", "ApplicationServices", str(helper_source), "-o", str(helper)], check=True)
+```
+The clang invocation does not pass `-fstack-protector-strong`, `-D_FORTIFY_SOURCE=2`, or an explicit `-Wl,-pie`. On current macOS, clang enables PIE by default for executables and applies reasonable stack protection, so this is not an active vulnerability. However, making the flags explicit ensures the binary is hardened portably across SDK upgrades, alternative toolchains (e.g., `clang` from Homebrew vs. Xcode), and future macOS versions where defaults might change.
+_Suggested fix:_ Extend the compile command to `[clang, "-framework", "ApplicationServices", "-fstack-protector-strong", "-D_FORTIFY_SOURCE=2", str(helper_source), "-o", str(helper)]`.
+
+---
+
+### Bugs & regressions
+
+**[medium] Windows `--allow-multiple-matches --destination clipboard` silently discards all captures except the last**
+`capture_screenshot.ps1:317–319, 396–401`
+The 2026-06-11 entry documented this behavior for the macOS/Python path; the Windows PowerShell script has the same issue independently. When `$AllowMultipleMatches` is set and `$Destination` is `clipboard`, `Capture-ToDestination` is called for each matched window handle in sequence. Each call executes `[Windows.Forms.Clipboard]::SetImage($bitmap)`, which atomically replaces the clipboard contents. For N matched windows, N `"clipboard"` lines are written to stdout, but only the last window's image remains. Users have no indication that earlier captures were discarded.
+_Suggested fix:_ Mirror the macOS suggestion from 2026-06-11: either (a) detect `$AllowMultipleMatches -and $Destination -eq 'clipboard'` and exit early with a structured error — `[Console]::Error.WriteLine("clipboard_allows_one: clipboard destination supports only one window at a time; use desktop for multiple captures"); exit 74` — or (b) emit a stderr warning listing how many captures were requested versus how many survived on the clipboard.
+
+**[low] macOS `--target active` cannot be exercised under the `CAPTURE_SCREENSHOT_TEST_PLATFORM=Darwin` test stub**
+`capture_screenshot.py:325–328`
+`resolve_macos_with_helper` short-circuits to the in-process `resolve_macos_window_ids` function only when `test_windows is not None and not active`. When `--target active` is used, `active=True`, so the condition is `False` and the function falls through to real clang compilation and a real `CGWindowList` query, regardless of `CAPTURE_SCREENSHOT_TEST_WINDOWS` being set. In a Linux CI environment (where clang is absent), this produces `ResolutionResult(False, "missing_dependency_clang", ...)` rather than a controlled test outcome. On macOS CI, it attempts a real window-system query. As a result, the test suite has no coverage for macOS active-window capture and cannot test that code path without a live macOS display session.
+_Suggested fix:_ Extend the test-stub branch: change the condition to `if test_windows is not None:` and, for the `active=True` case, return the first capturable entry from `test_windows` (e.g., the entry with the lowest index that has `capturable` not False). Add a corresponding test `test_macos_active_window_returns_first_capturable` that sets both env variables and asserts a successful resolution.
+
+---
+
+### Data leaks
+
+No new findings. The Windows clipboard last-wins bug (above) involves pixel data only; no window title metadata is written to the clipboard or to any output message. The `"clipboard"` string printed per capture does not encode title information. All previously documented title-privacy invariants continue to hold across all three platform paths.
+
+---
+
+### UX
+
+**[low] No test case exercises the macOS `--target active` end-to-end flow**
+`tests/test_capture_screenshot.py`
+Consequent on the bug entry above: the test suite covers macOS window-by-name resolution, minimized-window detection, multiple-match handling, and dry-run path output, but has no test for the active-window path (`--target active --destination desktop` or clipboard on Darwin). A regression in `resolve_macos_with_helper` when `active=True` — for example, a change to the `--frontmost` flag handling, the proc.returncode dispatch, or the `_validate_integer_ids` call — would not be caught.
+_Suggested fix:_ Once the test stub is extended (see Bugs & regressions above), add integration tests:
+1. `CAPTURE_SCREENSHOT_TEST_WINDOWS=[{"id":5,"owner":"Terminal","title":"x"}]` + `--target active --dry-run` → asserts `proc.returncode == 0` and printed path contains `active-window`.
+2. `CAPTURE_SCREENSHOT_TEST_WINDOWS=[{"id":5,"owner":"Terminal","title":"x","capturable":false}]` + `--target active` → asserts `proc.returncode == EXIT_NOT_CAPTURABLE`.
+
+**[info] `unique_capture_path` uses `EXIT_PRIVACY` for a resource-exhaustion condition**
+`capture_screenshot.py:99`
+```python
+die("could not allocate a unique screenshot filename", EXIT_PRIVACY)
+```
+`EXIT_PRIVACY = 73` is the documented exit code for privacy-enforcement failures (consent not given, symlink detected, permission lock-down failed). Running out of the 1000-candidate filename namespace is a resource/state problem, not a privacy violation. A caller inspecting exit codes would misclassify this as a privacy refusal. In practice, generating 1000 same-label screenshots in one session is essentially impossible, so this is cosmetic.
+_Suggested fix:_ Use `EXIT_UNAVAILABLE = 74` (or define `EXIT_INTERNAL = 70` as suggested in the 2026-06-08 entry) for this failure path.

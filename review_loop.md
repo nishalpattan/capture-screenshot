@@ -804,3 +804,60 @@ die("could not allocate a unique screenshot filename", EXIT_PRIVACY)
 ```
 `EXIT_PRIVACY = 73` is the documented exit code for privacy-enforcement failures (consent not given, symlink detected, permission lock-down failed). Running out of the 1000-candidate filename namespace is a resource/state problem, not a privacy violation. A caller inspecting exit codes would misclassify this as a privacy refusal. In practice, generating 1000 same-label screenshots in one session is essentially impossible, so this is cosmetic.
 _Suggested fix:_ Use `EXIT_UNAVAILABLE = 74` (or define `EXIT_INTERNAL = 70` as suggested in the 2026-06-08 entry) for this failure path.
+
+---
+
+## 2026-06-15
+
+### Security
+
+**[low] `capture_screenshot.ps1:93` — `New-Item` uses `-Path` instead of `-LiteralPath` for directory creation**
+`capture_screenshot.ps1:93`
+Every other path operation in the script uses `-LiteralPath` (fourteen call-sites: `Get-Item`, `Test-Path`, `Get-Acl`, `Set-Acl`, `Move-Item`, `Remove-Item`, `Get-Item` for reparse-point check). The sole exception is the directory creation call:
+```powershell
+New-Item -ItemType Directory -Path $Path -Force | Out-Null
+```
+PowerShell's `-Path` parameter interprets wildcard metacharacters (`[`, `]`, `*`, `?`). If `$OutputRoot` contains literal brackets — for example, a user's desktop folder named `[screenshots]` — `New-Item -Path` may expand the pattern to zero or multiple matching paths and fail with a non-obvious error, or (in edge cases) silently create a directory at an unintended location. Critically, the ACL operations immediately after use `-LiteralPath $Path`, so the ACE is applied to the literal string while the directory may have been created via an expanded path — a mismatch.
+Python's `_validate_output_root` checks home-containment but does not strip wildcard characters from `$OutputRoot`, and when the PS script is invoked directly (without the Python orchestrator) there is no home-containment check at all (noted in 2026-06-08), leaving `$Path` fully user-controlled.
+_Suggested fix:_ Replace `New-Item -ItemType Directory -Path $Path -Force` with `New-Item -ItemType Directory -LiteralPath $Path -Force`, consistent with every other path operation in the script.
+
+---
+
+### Bugs & regressions
+
+**[low] `capture_screenshot.ps1:22–62` — `Add-Type` inline C# recompiles on every fresh PowerShell process**
+`capture_screenshot.ps1:22`
+The 95-line inline C# block (Win32 P/Invoke declarations for `EnumWindows`, `GetWindowText`, `GetWindowRect`, `PrintWindow`, etc.) is compiled by `Add-Type` into a dynamic in-memory assembly at the start of every fresh PowerShell process. While PowerShell caches `Add-Type` results within a single runspace, each new `pwsh -File` invocation starts a fresh process with no cache. The compilation adds roughly 300–800 ms of fixed overhead to every capture request. The analogous macOS concern (clang recompiling `find_macos_window_id.m` on each call) was documented in the 2026-06-09 entry; the Windows path has the same class of latency issue.
+_Suggested fix:_ Pre-compile the Win32 declarations to a `.dll` at install time (`Add-Type -TypeDefinition ... -OutputAssembly scripts/Win32Capture.dll -OutputType Library`) and load it with `[System.Reflection.Assembly]::LoadFrom(...)` at runtime, recompiling only when the assembly is absent or outdated. This reduces per-invocation overhead to a single `Assembly.LoadFrom` call.
+
+**[info] `capture_screenshot.py:491` — `{temp-output}` dispatch assumes `plan.commands[0]` is a tuple, but `in` operator tests element membership, not substring**
+`capture_screenshot.py:491`
+```python
+if destination == "clipboard" and len(plan.commands) == 2 and "{temp-output}" in plan.commands[0]:
+```
+`plan.commands[0]` is a tuple of strings (e.g., `(grim, "{temp-output}")`). The `in` operator tests for exact element membership, not for a substring. This is correct for the current command structures, but the expression reads ambiguously to a maintainer who might think `in` is testing for a substring of a string. The 2026-06-12 entry documented the fragile `len == 2` guard; this note adds that the `in` check is also non-obvious in isolation.
+_Suggested fix:_ Add a comment: `# checks whether "{temp-output}" is one of the argument strings in the first command`, or rewrite as `any(part == "{temp-output}" for part in plan.commands[0])` to make the intent unambiguous.
+
+---
+
+### Data leaks
+
+No new findings. All previously documented title-privacy invariants continue to hold in the reviewed code. The `New-Item -Path` issue could cause incorrect directory creation but would not expose window title metadata. The `Add-Type` compilation path involves no user data. Error messages for the newly analysed paths echo only static strings or the user-supplied query, never real window titles.
+
+---
+
+### UX
+
+**[low] `capture_screenshot.ps1` — clipboard destination may throw with MTA threading error when script is invoked directly without `-Sta`**
+`capture_screenshot.ps1:317–319`
+`[Windows.Forms.Clipboard]::SetImage($bitmap)` requires the calling thread to be in Single-Threaded Apartment (STA) mode. When the Python orchestrator invokes the PS script it explicitly passes `-Sta` (line 537 of `capture_screenshot.py`), ensuring the correct apartment state. However, if the script is invoked directly — e.g., `pwsh -File capture_screenshot.ps1 -ConsentConfirmed -Destination clipboard ...` — PowerShell 7+ (`pwsh`) defaults to MTA threading. `SetImage` then throws:
+```
+Current thread must be set to single thread apartment (STA) mode before OLE calls can be made.
+```
+This manifests as an unhandled terminating error (exit 1) with a .NET stack trace rather than a structured exit code. PowerShell 5.1 (`powershell.exe`) already defaults to STA, so only `pwsh` direct invocations are affected.
+_Suggested fix:_ Add a threading-model check near the top of the script and emit a clear error: `if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne [System.Threading.ApartmentState]::STA -and $Destination -eq 'clipboard') { [Console]::Error.WriteLine("clipboard capture requires STA threading — invoke with: pwsh -Sta -File capture_screenshot.ps1 ..."); exit 64 }`.
+
+**[info] No test exercises the `--allow-multiple-matches` + desktop path for a multi-window query returning more than one ID**
+`tests/test_capture_screenshot.py`
+`test_macos_allow_multiple_returns_all_capturable` (line 231) verifies that `resolve_macos_window_ids` returns multiple IDs, and `test_prepare_output_paths_suffixes_duplicate_labels_in_one_request` (line 53) verifies filename deduplication. However, there is no end-to-end integration test that runs the full `main()` with `--allow-multiple-matches`, a multi-window stub, and `--destination desktop`, verifying that (a) two separate `.png` paths are printed, (b) each path is unique, and (c) the `reserved`-set deduplication in `prepare_output_paths` is exercised in the subprocess path. A regression in the `labels.extend(...)` / `prepare_output_paths` interaction would be silent.
+_Suggested fix:_ Add an integration test using `CAPTURE_SCREENSHOT_TEST_WINDOWS` with two capturable windows and `--allow-multiple-matches --destination desktop --dry-run`, asserting two distinct output paths are printed on separate lines.

@@ -861,3 +861,62 @@ _Suggested fix:_ Add a threading-model check near the top of the script and emit
 `tests/test_capture_screenshot.py`
 `test_macos_allow_multiple_returns_all_capturable` (line 231) verifies that `resolve_macos_window_ids` returns multiple IDs, and `test_prepare_output_paths_suffixes_duplicate_labels_in_one_request` (line 53) verifies filename deduplication. However, there is no end-to-end integration test that runs the full `main()` with `--allow-multiple-matches`, a multi-window stub, and `--destination desktop`, verifying that (a) two separate `.png` paths are printed, (b) each path is unique, and (c) the `reserved`-set deduplication in `prepare_output_paths` is exercised in the subprocess path. A regression in the `labels.extend(...)` / `prepare_output_paths` interaction would be silent.
 _Suggested fix:_ Add an integration test using `CAPTURE_SCREENSHOT_TEST_WINDOWS` with two capturable windows and `--allow-multiple-matches --destination desktop --dry-run`, asserting two distinct output paths are printed on separate lines.
+
+---
+
+## 2026-06-16
+
+### Security
+
+**[medium] macOS Screen Recording permission denied on 10.15+ silently yields "no matching window" rather than a permission diagnostic**
+`scripts/find_macos_window_id.m:67`
+On macOS Catalina (10.15) and later, `CGWindowListCopyWindowInfo(kCGWindowListOptionAll, kCGNullWindowID)` requires the Screen Recording permission. When that permission has been denied (or revoked), the API does NOT return `NULL` — it returns a non-NULL `CFArrayRef` containing only windows belonging to the calling process itself (the transient helper binary has no windows), filtered of title strings. The existing NULL guard at line 70 (`if (!windows) { return 1; }`) therefore never fires. The loop iterates zero or near-zero entries, so `capturable_count == 0` and `present_count == 0`; the helper exits with code 2. Python maps code 2 to `ResolutionResult(False, "no_matching_window", "No matching on-screen window found.")`. The user receives a misleading usage-style error with no indication that the Screen Recording permission must be granted in System Preferences → Privacy & Security. This undermines the consent-enforcement story: macOS's OS-level gate is the primary safeguard for the window-title enumeration, so its silent failure mode is security-relevant, not just cosmetic.
+_Suggested fix:_ After `CGWindowListCopyWindowInfo` returns a non-NULL but zero-count array, emit a specific token on stderr (e.g., `screen_recording_denied`) and return exit code 5. In Python's `resolve_macos_with_helper`, map exit code 5 to a new `ResolutionResult(False, "screen_recording_permission_denied", "Screen Recording permission is required — grant it in System Preferences → Privacy & Security → Screen Recording, then retry.")`.
+
+**[low] `ensure_private_directory` with `parents=True` secures only the leaf directory; intermediate parents created by Python's `mkdir` use default permissions**
+`capture_screenshot.py:108`
+`path.mkdir(mode=0o700, parents=True, exist_ok=True)` follows Python's documented `parents=True` semantics: only the leaf directory receives the supplied `mode`; missing intermediate ancestors are created with the default mode (typically `0o755`, further modified by umask). If a user supplies a deep `--output-root` such as `~/new_project/captures/screenshots` where `new_project/captures` does not yet exist, those ancestors are created world-traversable. Other users on a shared machine can therefore observe the existence of the directory hierarchy (but not its contents). The subsequent `path.chmod(0o700)` call only tightens the leaf. In the default case (`~/Desktop/screenshots`), `~/Desktop` already exists, so no new intermediary is created and this is benign; the risk appears only when a non-standard `--output-root` with non-existent parents is used.
+_Suggested fix:_ Walk the ancestors from the deepest existing one down and `chmod(0o700)` each newly created directory, or use a manual `os.makedirs`-equivalent that passes the mode to each created level. Alternatively, add documentation that `--output-root` parents must already exist.
+
+---
+
+### Bugs & regressions
+
+**[medium] `--query` values are silently discarded when `--target` is `fullscreen` or `active`; no warning is emitted**
+`capture_screenshot.py` (`main()`, fullscreen/active branches ~line 591–596)
+`parse_args` defines `--query` as an optional `append` argument with no constraint on which `--target` values it may accompany. In `main()`, `args.query` is consumed only inside the `if args.target == "window":` branch. When `--target fullscreen` or `--target active` is used with one or more `--query` values — e.g., `--target fullscreen --query Safari` — those queries are silently ignored and a full-screen or active-window capture proceeds. The user may have intended to narrow the scope (e.g., believing `--query` filters a multi-monitor fullscreen to one display), receiving instead a much wider capture than requested. This contradicts the privacy-first principle of never broadening scope silently.
+_Suggested fix:_ After the target branch selection, add a guard:
+```python
+if args.query and args.target != "window":
+    die(f"--query is only valid with --target window (got --target {args.target})", EXIT_USAGE)
+```
+Add a corresponding test asserting `EXIT_USAGE` when `--query` is supplied with a non-window target.
+
+**[low] PowerShell default `$OutputRoot` resolves to a relative path on Windows Server Core where `GetFolderPath('Desktop')` returns an empty string**
+`capture_screenshot.ps1:8`
+The default parameter value is:
+```powershell
+[string]$OutputRoot = (Join-Path ([Environment]::GetFolderPath('Desktop')) 'screenshots')
+```
+On Windows Server Core, Nano Server, and container images without a desktop shell, `[Environment]::GetFolderPath('Desktop')` returns an empty string `""`. `Join-Path "" 'screenshots'` evaluates to `screenshots` (a bare relative path). When the script is invoked directly without the Python orchestrator (which always passes `-OutputRoot` explicitly), `Protect-Directory -Path 'screenshots'` creates a directory named `screenshots` in whatever the current working directory happens to be — potentially outside the user's home. Combined with the previously documented absence of home-containment enforcement in the PS script (2026-06-08), this creates a path where screenshots land in an unintended, unprotected location.
+_Suggested fix:_ Change the default to `(Join-Path ([Environment]::GetFolderPath('UserProfile')) 'Desktop\screenshots')` or validate at the top of the script that `$OutputRoot` is non-empty and rooted, failing with a structured message if not.
+
+---
+
+### Data leaks
+
+No new findings. The `--query` silent-discard bug (above) routes the discarded query values to oblivion rather than to any output or log, so no title or query text is exposed. The Screen Recording permission failure path emits only the static exit code 2 and a static string; no window title information reaches the helper's output. All previously documented title-privacy invariants continue to hold in the reviewed code.
+
+---
+
+### UX
+
+**[medium] No diagnostic path exists when macOS Screen Recording permission is missing or denied**
+`scripts/find_macos_window_id.m:67`, `capture_screenshot.py:resolve_macos_with_helper`
+(Same root cause as the security finding above.) When Screen Recording permission is absent, every named-window and active-window request on macOS fails with the generic "no_matching_window" / "No matching on-screen window found" message. The user has no indication that the problem is a system permission rather than a typo in the app name. The error message for `no_matching_window` suggests checking the window name, sending the user on a fruitless debugging path. A first-time installer is especially likely to hit this: the skill's `install.sh` grants no permission automatically, and the OS's permission prompt may have been dismissed or may not appear until the Screen Recording permission is triggered — which it currently isn't because the failed API call returns a partial result rather than failing visibly.
+_Suggested fix:_ Same as the security finding: add an exit code 5 from the helper and map it to a human-readable permission guidance message in Python.
+
+**[low] `test_skill_notice_documents_privacy_consent_and_intended_use` raises `FileNotFoundError` rather than a descriptive assertion failure if `SKILL.md` is absent or renamed**
+`tests/test_capture_screenshot.py:SKILL_MD` (module level, line ~13)
+`SKILL_MD = ROOT / "SKILL.md"` is defined at module level and used inside the test as `SKILL_MD.read_text(encoding="utf-8")`. If the file does not exist (e.g., renamed to `skill.md` on a case-sensitive filesystem, or deleted), the test fails with an unhandled `FileNotFoundError` rather than an assertion failure, which obscures the root cause when running the full test suite.
+_Suggested fix:_ Wrap the `read_text` call in a `try/except FileNotFoundError` or add `self.assertTrue(SKILL_MD.exists(), "SKILL.md not found — is the file path correct?")` as the first assertion in the test.

@@ -920,3 +920,73 @@ _Suggested fix:_ Same as the security finding: add an exit code 5 from the helpe
 `tests/test_capture_screenshot.py:SKILL_MD` (module level, line ~13)
 `SKILL_MD = ROOT / "SKILL.md"` is defined at module level and used inside the test as `SKILL_MD.read_text(encoding="utf-8")`. If the file does not exist (e.g., renamed to `skill.md` on a case-sensitive filesystem, or deleted), the test fails with an unhandled `FileNotFoundError` rather than an assertion failure, which obscures the root cause when running the full test suite.
 _Suggested fix:_ Wrap the `read_text` call in a `try/except FileNotFoundError` or add `self.assertTrue(SKILL_MD.exists(), "SKILL.md not found — is the file path correct?")` as the first assertion in the test.
+
+---
+
+## 2026-06-17
+
+### Security
+
+**[low] Helper compilation temp directory is visible in world-traversable `/tmp`, leaking capture timing metadata to co-tenants**
+`capture_screenshot.py:337` (`resolve_macos_with_helper`)
+`tempfile.TemporaryDirectory(prefix="screenshot-window.")` creates a directory in the system temp directory (typically `/tmp` on Linux/macOS). The temp directory itself is created with mode 0o700 (contents are protected), but its existence in the world-traversable `/tmp` (mode 0o1777) is visible to any user who can run `ls /tmp`. A co-tenant can therefore observe that a `screenshot-window.XXXXXX` directory exists, deduce that a macOS named-window or active-window capture is in progress, and correlate its creation timestamp to infer capture timing. The directory content (compiled helper binary, window IDs emitted at runtime) remains protected. This is distinct from the 2026-06-08 finding (clipboard temp PNG in `/tmp`): the desktop-path temp file is created inside a 0o700 request directory so metadata is also hidden, but the compilation directory does not receive the same treatment.
+_Suggested fix:_ Create the compilation temp directory inside a pre-existing private directory (e.g., under the same `ensure_private_directory`-created output root, or a `tempfile.mkdtemp()` inside the user's home), ensuring the directory name is not visible in world-traversable space. If a home-rooted location is impractical for the compile step, at minimum note in privacy documentation that capture attempts create a visible directory entry in `/tmp`.
+
+**[low] `sanitize_label` strips only `http://` and `https://` schemes; other URL-like schemes (`ftp://`, `file://`, `mailto:`) are not removed**
+`capture_screenshot.py:71`, `capture_screenshot.ps1:69`
+```python
+label = re.sub(r"https?://", "", label)
+```
+and
+```powershell
+$label = $Value.ToLowerInvariant() -replace 'https?://', ''
+```
+A window title containing `ftp://my.server/private-path` or `file:///etc/internal-notes` produces a sanitized label such as `ftp-my-server-private-path` or `file-etc-internal-notes`. No path traversal is possible (all non-alphanumeric characters subsequently become `-`), and the scheme component leaks no more information than the rest of the title would. However, the scheme prefix (`ftp-`, `file-`) remains in the filename, partly defeating the purpose of URL-stripping (which presumably targets privacy — keeping server names out of filenames when a browser tab title contains a URL). Both the Python and PowerShell implementations mirror this narrow pattern; it appears intentional for HTTP/HTTPS only, but is undocumented.
+_Suggested fix:_ Broaden the pattern to strip any URL scheme: `re.sub(r"[a-z][a-z0-9+\-.]*://", "", label, flags=re.I)` (RFC 3986 scheme grammar) and apply the same change to the PowerShell equivalent. Or add a comment explaining why only HTTP/HTTPS schemes are intentionally removed.
+
+---
+
+### Bugs & regressions
+
+**[medium] Windows `GetWindowRect` returns DWM extended-frame bounds including invisible drop-shadow margin, causing stray pixels in captured images**
+`capture_screenshot.ps1:225–246` (`Get-WindowBounds`, `Copy-Rectangle`, `Copy-Window`)
+On Windows Vista and later with Desktop Window Manager (DWM) enabled, `GetWindowRect` returns the "extended frame" bounds for DWM-composited windows, which include an invisible drop-shadow region — typically 7–9 logical pixels on each side. When `Copy-Rectangle` is used (for fullscreen and as the screen-blit path in `Copy-Window` fallback), the bitmap dimensions are based on these extended bounds and `CopyFromScreen` captures the corresponding screen region: the shadow margin pixels contain whatever is rendered behind the window at those positions (desktop or neighboring window content). For the `Copy-Window` path (`PrintWindow` + GDI+), the DC is also sized to the extended bounds; pixels in the shadow margin are not written by `PrintWindow` and remain as the zero-initialized GDI+ color (black), producing a narrow black border around the actual window content in the saved PNG. The Windows API `DwmGetWindowAttribute(hWnd, DWMWA_EXTENDED_FRAME_BOUNDS, &rect, sizeof(rect))` returns the visible client-frame bounds excluding the shadow, matching what the user sees on screen.
+_Suggested fix:_ Add a `DwmGetWindowAttribute` P/Invoke signature to the inline C# block in the PowerShell script and update `Get-WindowBounds` to prefer `DWMWA_EXTENDED_FRAME_BOUNDS` over `GetWindowRect` for any window handle that is not zero (i.e., for named and active captures). Fall back to `GetWindowRect` when the DWM call fails (e.g., non-DWM window or Windows Server Core). Fullscreen capture already uses `SystemInformation.VirtualScreen` and is unaffected.
+
+**[low] `test_windows_delegates_to_powershell` embeds temp file path in shell script without quoting, fragile on paths with spaces**
+`tests/test_capture_screenshot.py:309`
+```python
+fake_ps.write_text(
+    f'#!/bin/sh\nprintf "%s\\n" "$@" > {args_file}\necho "fake/path.png"\n'
+)
+```
+`args_file` is a `Path` object whose string representation is interpolated directly into the shell script without quoting. On macOS, `tempfile.TemporaryDirectory()` creates directories under `/private/var/folders/…` (which currently contains no spaces), and on Linux under `/tmp/tmpXXXXXX`. If a CI runner configures `TMPDIR` to a path with spaces (not uncommon on macOS GitHub Actions), the shell redirect `> /path with spaces/file.txt` would be parsed incorrectly, causing the fake `powershell.exe` to fail with a shell error rather than writing the expected args file. The test would then report a false failure in `captured = args_file.read_text()` (FileNotFoundError) rather than in the code under test, obscuring the root cause.
+_Suggested fix:_ Quote the path in the shell script: `f'#!/bin/sh\nprintf "%s\\n" "$@" > "{args_file}"\necho "fake/path.png"\n'`, or use `shlex.quote(str(args_file))` to handle any metacharacters robustly.
+
+---
+
+### Data leaks
+
+No new findings. The DWM shadow-margin pixels captured by `Copy-Rectangle` are rendered screen content of neighboring windows or the desktop (pixel data only, not window title metadata). The helper compilation temp directory in `/tmp` leaks existence and timing metadata, as documented above under Security, but not window IDs or image content. The incomplete URL scheme stripping in `sanitize_label` could leave `ftp-` or `file-` prefixes in filenames, but not server names or path segments beyond what the full label sanitization already permits. All previously documented title-privacy invariants continue to hold across all three platform paths.
+
+---
+
+### UX
+
+**[low] WSL (Windows Subsystem for Linux) is not detected; capture attempts silently fall through to tool-not-found errors with no platform guidance**
+`capture_screenshot.py:570` (`main()`, platform detection)
+On WSL, `platform.system()` returns `"Linux"`, so the code enters the Linux path. WSL environments typically have no X display server, Wayland compositor, or GNOME session running. All tool detections via `detect_tools()` return empty results, and `plan_capture` exits with `missing_dependency_fullscreen` or `missing_dependency_named_window`. The error message gives no indication that the running environment is WSL or that the Windows native capture path (invoking the script from PowerShell directly) should be used instead. CONTRIBUTING.md acknowledges this gap under "Good first issues" item 5.
+_Suggested fix:_ Detect WSL by reading `/proc/version` for the substring `microsoft` or `WSL` (case-insensitive) before the Linux tool-detection block, and `die("WSL is not a supported capture environment — run the script from a native Windows PowerShell session to use the Windows capture path", EXIT_UNAVAILABLE)`.
+
+**[info] CONTRIBUTING.md code snippet for `plan_capture()` shows `(session_type or "").lower()` but the real implementation also falls back to `os.environ.get("XDG_SESSION_TYPE")`**
+`CONTRIBUTING.md:35–44`, `capture_screenshot.py:234`
+The CONTRIBUTING.md example shows:
+```python
+session = (session_type or "").lower()
+```
+The actual code is:
+```python
+session = (session_type or os.environ.get("XDG_SESSION_TYPE") or "").lower()
+```
+A contributor following the docs snippet would omit the environment variable fallback and potentially produce a plan that ignores `XDG_SESSION_TYPE` when `session_type` is an empty string, introducing a silent regression. The discrepancy is cosmetic (a simplified example), but could mislead a contributor adding a new session type branch.
+_Suggested fix:_ Update the CONTRIBUTING.md snippet to match the actual code or add a comment noting that the snippet is simplified and contributors should read the actual function signature.

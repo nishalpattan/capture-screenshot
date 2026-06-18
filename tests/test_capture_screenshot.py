@@ -361,5 +361,16 @@ class CaptureScreenshotUnitTests(unittest.TestCase):
                 self.assertIn(phrase, text)
 
 
+    def test_linux_spectacle_active_window_fallback(self):
+        plan = self.mod.plan_capture(
+            platform_name="Linux",
+            target="active",
+            destination="desktop",
+            label="active",
+            tools={"spectacle": "/usr/bin/spectacle"},
+        )
+        self.assertTrue(plan.ok)
+        self.assertEqual(plan.commands[0], ("/usr/bin/spectacle", "-b", "-n", "-w", "-o", "{output}"))
+
 if __name__ == "__main__":
     unittest.main()

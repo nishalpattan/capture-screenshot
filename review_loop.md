@@ -990,3 +990,129 @@ session = (session_type or os.environ.get("XDG_SESSION_TYPE") or "").lower()
 ```
 A contributor following the docs snippet would omit the environment variable fallback and potentially produce a plan that ignores `XDG_SESSION_TYPE` when `session_type` is an empty string, introducing a silent regression. The discrepancy is cosmetic (a simplified example), but could mislead a contributor adding a new session type branch.
 _Suggested fix:_ Update the CONTRIBUTING.md snippet to match the actual code or add a comment noting that the snippet is simplified and contributors should read the actual function signature.
+
+---
+
+## 2026-06-18
+
+### Security
+
+**[low] `secure_file()` catches `PermissionError` only, not the full `OSError` hierarchy**
+`capture_screenshot.py:117–121`
+```python
+def secure_file(path: Path) -> None:
+    try:
+        path.chmod(0o600)
+    except PermissionError:
+        die("could not secure screenshot file permissions", EXIT_PRIVACY)
+```
+`path.chmod()` may raise other `OSError` subclasses: `FileNotFoundError` (ENOENT, if the file
+was deleted between creation and the chmod call), `OSError` with `EROFS` (read-only filesystem),
+or `NotADirectoryError`. These propagate as unhandled Python exceptions — a raw traceback with
+exit code 1 — rather than a structured `die()` message. In practice the file is always freshly
+created by `private_temp_png` or `os.replace`, making ENOENT very unlikely, but the narrow
+`except PermissionError` leaves other error modes unhandled in a privacy-critical path.
+_Suggested fix:_ Broaden the catch to `except OSError as e:` and use
+`die(f"could not secure screenshot file permissions: {e.strerror}", EXIT_PRIVACY)`, consistent
+with the intent of the surrounding code.
+
+**[low] `Copy-Window` leaks GDI `$bitmap` if `FromImage` or `GetHdc` raises before the outer `finally`**
+`capture_screenshot.ps1:255–271`
+```powershell
+$bitmap = [Drawing.Bitmap]::new($Bounds.Width, $Bounds.Height)
+$graphics = [Drawing.Graphics]::FromImage($bitmap)   # could throw
+try {
+    $hdc = $graphics.GetHdc()                         # could throw
+    ...
+} finally {
+    $graphics.Dispose()
+}
+```
+If `FromImage` throws (e.g., out-of-GDI-handle condition), `$graphics` is never assigned and
+`$bitmap` is never disposed, because the `try/finally` is never entered. Likewise if `GetHdc`
+throws, the outer `finally` disposes `$graphics` but `$bitmap` is not cleaned up (the `if -not
+$ok` path that calls `$bitmap.Dispose()` is never reached). The bitmap allocated on line 255 is
+then leaked until the process exits. `Capture-ToDestination`'s own `try/finally` does not cover
+this allocation because `Copy-Window` throws rather than returning `$bitmap`. In practice,
+`FromImage` and `GetHdc` rarely fail on a freshly allocated bitmap, but GDI exhaustion on
+resource-constrained systems can trigger this.
+_Suggested fix:_ Restructure `Copy-Window` with a trap around the full allocation block, or move
+the `$bitmap` disposal into the same `finally` as `$graphics`: at function exit, if `$bitmap`
+is not being returned (i.e., an exception is in flight), call `$bitmap.Dispose()`.
+
+---
+
+### Bugs & regressions
+
+**[low] `clang` compilation has no `capture_output=True`; compiler diagnostics emit on the user's terminal**
+`capture_screenshot.py:339`
+```python
+subprocess.run([clang, "-framework", "ApplicationServices", str(helper_source), "-o", str(helper)], check=True)
+```
+The helper binary's runtime output is captured (`capture_output=True` on line 347), but the
+`clang` compilation step is not. Any warnings clang emits (e.g., implicit-function-declaration
+notes, SDK deprecation notices) go directly to the calling process's stderr, intermixed with the
+script's own output. A user running a normal `--target window` request would see unexpected clang
+diagnostic lines that give no actionable guidance. When compilation fails (already noted as the
+2026-06-09 bug), the error is already visible on terminal before the unhandled `CalledProcessError`
+propagates; this finding is about the success path also leaking diagnostics.
+_Suggested fix:_ Add `stderr=subprocess.PIPE` (or `capture_output=True`) to the clang invocation
+and include `e.stderr` in the structured `ResolutionResult` message if compilation fails (the fix
+proposed in the 2026-06-09 entry would naturally capture stderr at that point).
+
+**[low] `resolve_linux_named_window` calls `_linux_window_is_viewable` for every matched ID before the `allow_multiple` count check**
+`capture_screenshot.py:405–416`
+```python
+classified = [(wid, _linux_window_is_viewable(wid, tools)) for wid in ids]
+if any(state is None for _, state in classified):
+    capturable = ids
+else:
+    capturable = tuple(wid for wid, state in classified if state)
+    ...
+if len(capturable) > 1 and not allow_multiple:
+    return ResolutionResult(False, "multiple_matches", ...)
+```
+`_linux_window_is_viewable` calls `subprocess.run([xprop, ...])` or `subprocess.run([xwininfo, ...])`
+for each window ID. When a query matches N windows (e.g., a common app name) and
+`allow_multiple=False`, the function performs N subprocess round-trips before concluding
+"multiple matches" and returning an error. Even when the second ID makes the multiple-match
+outcome certain, all remaining IDs are still classified. On a machine where xprop is slow or the
+X server is under load, this adds noticeable latency proportional to N. Combined with the
+no-timeout concern (2026-06-11 entry), a single hung `xprop` call blocks all subsequent
+classifications.
+_Suggested fix:_ In the `not allow_multiple` path, break out of the classification loop as soon
+as two capturable IDs have been found — a short-circuit that avoids all remaining subprocess
+calls. The `allow_multiple` path must still classify all IDs.
+
+---
+
+### Data leaks
+
+No new findings. All previously documented title-privacy invariants continue to hold across all
+three platform paths. The `clang` diagnostic output (bugs above) includes only source-file paths
+and compiler codes, not window titles or user data. The GDI bitmap leak involves only pixel data
+in kernel-managed memory, inaccessible to other processes. Error messages on all three platforms
+continue to echo only the user-supplied query text, never real window titles retrieved from the OS.
+
+---
+
+### UX
+
+**[info] `clang` compile warnings appear on user terminal during normal operation**
+`capture_screenshot.py:339`
+(Same root cause as the bugs finding above.) From a user-experience perspective, a normal
+`--target window` capture might print clang warnings such as deprecation notices or
+implicit-conversion notes before the screenshot path is printed. These lines have no meaning
+to an end user and provide no remediation guidance. On macOS systems where the Xcode Command
+Line Tools version diverges from the SDK, deprecation warnings can appear even for clean source.
+_Suggested fix:_ Same as the bugs entry above — redirect the compile stderr to `subprocess.PIPE`
+and surface it only in structured error messages on failure.
+
+**[low] `resolve_linux_named_window` performs unnecessary subprocess round-trips on common-name queries**
+`capture_screenshot.py:405–416`
+(Same root cause as the bugs finding above, UX angle.) A user querying a common process name
+(e.g., `--query "a"`, `--query "Code"`) on a desktop with many open windows experiences latency
+proportional to the match count before receiving the "multiple matches" error, with no progress
+indication. The delay is invisible because the script produces no interim output.
+_Suggested fix:_ Same as the bugs entry — short-circuit classification after two capturable
+matches are found when `allow_multiple=False`.

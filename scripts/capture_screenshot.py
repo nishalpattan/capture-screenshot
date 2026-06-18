@@ -279,6 +279,10 @@ def plan_capture(
                 if destination == "clipboard":
                     return CapturePlan(True, "ok", "ok", ((gnome, "-w", "-c"),))
                 return CapturePlan(True, "ok", "ok", ((gnome, "-w", "-f", "{output}"),))
+            if spectacle:
+                if destination == "clipboard":
+                    return CapturePlan(True, "ok", "ok", ((spectacle, "-b", "-n", "-w", "-c"),))
+                return CapturePlan(True, "ok", "ok", ((spectacle, "-b", "-n", "-w", "-o", "{output}"),))
             return CapturePlan(
                 False,
                 "missing_dependency_active_window",

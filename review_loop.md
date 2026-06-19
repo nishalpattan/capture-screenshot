@@ -1116,3 +1116,120 @@ proportional to the match count before receiving the "multiple matches" error, w
 indication. The delay is invisible because the script produces no interim output.
 _Suggested fix:_ Same as the bugs entry — short-circuit classification after two capturable
 matches are found when `allow_multiple=False`.
+
+---
+
+## 2026-06-19
+
+### Security
+
+**[low] `ensure_private_directory` has the same narrow error-catch pattern as the 2026-06-18 `secure_file` finding**
+`capture_screenshot.py:107,112`
+`path.mkdir(mode=0o700, parents=True, exist_ok=True)` (line 107) and `path.stat()` (line 112) are
+outside the `try/except PermissionError` block that guards only `path.chmod()`. If `mkdir` fails
+with `OSError(ENOSPC)` (disk full), `OSError(EROFS)` (read-only filesystem), or
+`NotADirectoryError` (a parent path component is a regular file), the exception propagates as an
+unhandled Python traceback with exit code 1. In a privacy-critical path where the output directory
+is being secured before any screenshot data is written, these failure modes should surface as
+structured `die()` messages. The 2026-06-18 entry documented the identical pattern in `secure_file`;
+this finding extends it to the sibling function `ensure_private_directory`.
+_Suggested fix:_ Wrap both `path.mkdir()` and `path.stat()` in a `try/except OSError as e:` block
+and call `die(f"could not create private screenshots directory: {e.strerror}", EXIT_PRIVACY)`,
+consistent with the approach proposed for `secure_file`.
+
+**[low] `_validate_output_root` validates the resolved path but passes the original (potentially relative) string to PowerShell**
+`capture_screenshot.py:522–527, 541`
+`_validate_output_root(path)` calls `path.resolve()` (line 525) to obtain the canonical absolute
+path for the home-containment check. However, `_run_powershell_script` passes `str(args.output_root)`
+(line 541) — the original, unresolved value — to PowerShell via `-OutputRoot`. If the user supplies
+a relative `--output-root` such as `--output-root screenshots`, Python resolves `screenshots` to an
+absolute path (e.g., `/home/user/projects/screenshots`) and validates that result. PowerShell
+receives the bare string `"screenshots"` and uses `Protect-Directory -Path 'screenshots'`, creating
+the directory relative to PowerShell's inherited cwd. Because Python and the PowerShell subprocess
+share the same working directory (subprocess inherits the parent's cwd), the effective absolute
+path is identical in practice, so this is not an active vulnerability. It is, however, a latent
+maintenance hazard: any future change that sets a different `cwd=` in the `subprocess.run` call
+inside `_run_powershell_script` would silently break the invariant that the validated path and the
+used path are the same.
+_Suggested fix:_ Pass `str(args.output_root.resolve())` to PowerShell to make the absolute-path
+guarantee explicit and robust to future refactoring.
+
+---
+
+### Bugs & regressions
+
+**[low] `run_command` does not redirect screenshot-tool stdout/stderr, risking structured-output pollution**
+`capture_screenshot.py:465`
+`subprocess.run(args, check=True)` inherits the calling process's stdout and stderr file descriptors.
+Screenshot tools such as ImageMagick `import`, `spectacle`, and `gnome-screenshot` may emit
+diagnostic warnings or informational lines. Because `run_command` provides no redirection, these
+lines are written directly to the Python script's stdout — interleaved with the structured output
+(file paths or `"clipboard"`) that callers (AI agents, shell scripts) parse. For example,
+`import -window root output.png` may emit X11 connection warnings to stderr; some builds of
+`spectacle` write a status line to stdout before writing the file. An agent parsing the script's
+stdout for the saved path could be confused by extra, unexpected lines. The 2026-06-18 entry
+documented the same issue for the `clang` compilation step specifically; this finding extends it to
+the runtime screenshot-tool invocations.
+_Suggested fix:_ In `run_command`, pass `stderr=subprocess.PIPE` to capture tool stderr and include
+it in any `CalledProcessError` message (which also addresses the 2026-06-11 `CalledProcessError`
+finding). For stdout, pass `stdout=subprocess.DEVNULL` unless the tool is known to produce output
+needed by the caller — none of the currently used screenshot tools write meaningful data to stdout
+(they write to the output file path instead). This change fully isolates tool diagnostic output from
+the Python script's structured result lines.
+
+**[info] `_test_windows()` validates `"id"`, `"capturable"`, and `"state"` field types but not `"owner"` or `"title"`**
+`capture_screenshot.py:310–322`
+`_test_windows()` checks that `"id"` is an `int`, `"capturable"` is a `bool`, and `"state"` is a
+`str`, but applies no type validation to `"owner"` or `"title"`. Both fields are consumed in
+`resolve_macos_window_ids` via `str(window.get("owner", ""))` and `str(window.get("title", ""))`,
+so a non-string value (e.g., `{"owner": 42}`) silently coerces to `"42"` rather than triggering a
+validation error. This is inconsistent with the explicit checks on the other three fields and could
+mask a malformed test fixture where an integer was accidentally used where a string was intended.
+The risk is test-only; there is no production impact.
+_Suggested fix:_ Add `if "owner" in entry and not isinstance(entry["owner"], str): die(...)` and the
+equivalent for `"title"`, consistent with the existing validation pattern for the other fields.
+
+---
+
+### Data leaks
+
+No new findings. All previously documented title-privacy invariants continue to hold in the reviewed
+code. The `ensure_private_directory` error-handling gap involves OS-level error strings (`ENOSPC`,
+`EROFS`) — not window titles. The `run_command` stdout/stderr concern involves tool diagnostics
+(X11 display strings, rendering status lines), not window title metadata retrieved from the OS.
+The relative-path PowerShell issue involves only the output directory path. No new code paths that
+could expose window titles were identified.
+
+---
+
+### UX
+
+**[low] README "Named window → clipboard" example works on macOS but crashes with an opaque error on Linux X11**
+`README.md:122–126`, `capture_screenshot.py:288–296, 499–502`
+The README presents "Screenshot the Figma window and copy it to my clipboard" as a working usage
+example. On macOS this works correctly. On Linux X11 with `xdotool` + ImageMagick `import` (the
+only currently supported named-window capture backend on X11), the 2026-06-10 high-severity bug
+applies: `plan_capture` returns commands containing `"{output}"` placeholders, but `execute_plan`'s
+clipboard branch (line 499) calls `run_command(command)` without the `output` argument, causing
+an immediate exit with "internal error: missing output path" (exit 64). The feature as documented
+is not functional on that platform. A user on a minimal, GNOME-free X11 desktop who follows this
+example will receive the opaque internal error with no hint that named-window clipboard capture is
+unsupported on their setup.
+_Suggested fix:_ Add a platform qualification to the README example noting that named-window
+clipboard capture is supported on macOS and Windows but not on Linux X11 at present. Alternatively,
+fix the underlying 2026-06-10 bug (return `CapturePlan(False, "unsupported_linux_x11_window_clipboard", …)`)
+and update the README once the fix is in place.
+
+**[info] `CONTRIBUTING.md` test-data schema omits the `capturable` and `state` fields**
+`CONTRIBUTING.md:77`, `capture_screenshot.py:_test_windows(), resolve_macos_window_ids()`
+The CONTRIBUTING.md table documents `CAPTURE_SCREENSHOT_TEST_WINDOWS` entries as having fields
+`{"id": int, "owner": str, "title": str}`. The actual implementation also handles `"capturable":
+bool` (defaults to `true`; set `false` to simulate a minimized or off-Space window) and `"state":
+str` (e.g., `"minimized"`, `"offscreen"`, `"unknown"`) used in `not_capturable_message`. Tests in
+`test_capture_screenshot.py` depend on both fields (lines 99, 126, 149, 164, 236). A contributor
+writing a new test for minimized-window behaviour using only CONTRIBUTING.md as a reference would
+not discover these fields. The 2026-06-17 info entry noted a different CONTRIBUTING.md inaccuracy
+(the `plan_capture` code snippet omitting the `XDG_SESSION_TYPE` fallback); this finding is a
+distinct, additional omission in the test-data documentation.
+_Suggested fix:_ Extend the CONTRIBUTING.md table entry to document the full schema:
+`{"id": int, "owner": str, "title": str, "capturable": bool (default true), "state": str (optional, e.g. "minimized" / "offscreen" / "unknown")}`.

@@ -1233,3 +1233,124 @@ not discover these fields. The 2026-06-17 info entry noted a different CONTRIBUT
 distinct, additional omission in the test-data documentation.
 _Suggested fix:_ Extend the CONTRIBUTING.md table entry to document the full schema:
 `{"id": int, "owner": str, "title": str, "capturable": bool (default true), "state": str (optional, e.g. "minimized" / "offscreen" / "unknown")}`.
+
+---
+
+## 2026-06-20
+
+### Security
+
+**[low] `Copy-Rectangle` leaks GDI `$bitmap` if `Graphics::FromImage()` raises before the `try` block is entered**
+`capture_screenshot.ps1:238-246`
+The pattern is identical to the `Copy-Window` finding from 2026-06-18 but at a different function.
+`$bitmap` is allocated unconditionally on line 238, then `[Drawing.Graphics]::FromImage($bitmap)` is
+called. If `FromImage` raises (e.g., GDI handle exhaustion on a resource-constrained host), the `try`
+block is never entered, so neither `$graphics.Dispose()` (in the inner `finally`) nor any cleanup for
+`$bitmap` runs. The caller (`Capture-ToDestination`) has a `try/finally { $bitmap.Dispose() }` guard,
+but because `Copy-Rectangle` throws rather than returning, the caller's `$bitmap` variable is never
+assigned, leaving the allocated `Bitmap` object unreachable for the duration of the process.
+_Suggested fix:_ Wrap the `$bitmap` allocation and `FromImage` call in a `try` block with a `catch`
+that disposes `$bitmap` and re-throws, or restructure so `$bitmap` is disposed inside the same
+`finally` as `$graphics`:
+```powershell
+$bitmap = [Drawing.Bitmap]::new($Bounds.Width, $Bounds.Height)
+try {
+    $graphics = [Drawing.Graphics]::FromImage($bitmap)
+    try { $graphics.CopyFromScreen(...); return $bitmap }
+    finally { $graphics.Dispose() }
+} catch { $bitmap.Dispose(); throw }
+```
+
+**[low] `CopyFromScreen` in `Copy-Rectangle` can throw `Win32Exception` on display-unavailable sessions with no structured handling**
+`capture_screenshot.ps1:241`
+`$graphics.CopyFromScreen(...)` calls the GDI `BitBlt` API internally. In environments where no
+physical or virtual display frame-buffer is accessible — Remote Desktop sessions with GPU
+acceleration disabled, Citrix ICA sessions, Windows Server Core without a display driver, or
+headless CI runners — `CopyFromScreen` raises `System.ComponentModel.Win32Exception`. Because
+`$ErrorActionPreference = 'Stop'` is set globally, this becomes a terminating error and the script
+exits with code 1 and a raw .NET exception trace. There is no equivalent to the `Test-BitmapAllBlack`
+advisory path that exists for `PrintWindow`. The `--target fullscreen` and `--target active` code
+paths both route through `Copy-Rectangle` (the former always, the latter as the `Copy-Window` screen
+fallback), so both are affected.
+_Suggested fix:_ Wrap the `CopyFromScreen` call in `try/catch [System.ComponentModel.Win32Exception]`
+and emit `[Console]::Error.WriteLine("window_not_capturable: screen buffer is unavailable in this
+session — try running in a session with an active display"); exit 75` to give a structured, actionable
+error code matching the documented exit table.
+
+**[info] `_validate_integer_ids` uses `str.isdigit()` rather than `str.isdecimal()`, accepting non-decimal Unicode digit characters**
+`capture_screenshot.py:83`
+```python
+if not id_str.isdigit():
+```
+Python's `str.isdigit()` returns `True` for superscript and subscript digits (`²`, `³`, `⁴` …),
+Roman numeral digits, and other Unicode characters classified as "digit" but not "decimal" (e.g.,
+`"²".isdigit()` is `True`, `"²".isdecimal()` is `False`). In practice the macOS
+`CGWindowListCopyWindowInfo` helper and xdotool exclusively emit ASCII decimal strings, so this
+cannot be exploited; but the validation is technically wider than intended and would silently accept
+a non-decimal digit string that would then fail at the OS API call site (e.g., `screencapture -l
+²`). Using `str.isdecimal()` or `re.fullmatch(r'[0-9]+', id_str)` would express the intended
+constraint precisely.
+_Suggested fix:_ Replace `id_str.isdigit()` with `id_str.isdecimal()` (or an explicit ASCII-digit
+regex) so the guard matches exactly the set of strings that are valid decimal window IDs.
+
+**[info] Test-override environment variables have no production-mode guard**
+`capture_screenshot.py:302-322` (`_test_platform`, `_test_windows`)
+`CAPTURE_SCREENSHOT_TEST_PLATFORM` and `CAPTURE_SCREENSHOT_TEST_WINDOWS` are read
+unconditionally from the environment with no check that the process is running in a test context.
+If either variable is inadvertently set in a production or agent-pipeline environment — for example,
+leaked from a CI step that did not clean up its exported variables, or set by a co-process sharing
+the same environment — the script silently redirects platform detection or window resolution to
+mock values without any warning. A consumer (human or agent) receives a plausible success but the
+capture was performed against synthetic data. There is no `--no-test-overrides` flag or similar
+explicit opt-in to test mode.
+_Suggested fix:_ Add a note to the module docstring and to SKILL.md warning that these variables
+must never be set in production. Alternatively, gate their use on an explicit `--test-mode` flag
+or on the presence of both variables together, so a single stray variable cannot silently alter
+behaviour.
+
+---
+
+### Bugs & regressions
+
+**[low] Linux `--target window --allow-multiple-matches` in dry-run does not exercise the xdotool + xprop label-deduplication chain in any integration test**
+`tests/test_capture_screenshot.py`
+`test_prepare_output_paths_suffixes_duplicate_labels_in_one_request` (line 53) verifies filename
+deduplication in isolation, and `test_linux_viewable_window_passes_through` (line 198) exercises
+`resolve_linux_named_window` with a fake xdotool. However, no integration test wires these together:
+no test runs the full script subprocess with `CAPTURE_SCREENSHOT_TEST_PLATFORM=Linux`, fake xdotool
+returning two IDs, fake xprop marking both viewable, `--allow-multiple-matches`, and
+`--destination desktop --dry-run`, then asserts that two distinct output paths are printed on
+separate lines. A regression in the `labels.extend([sanitize_label(query)] * len(resolution.ids))`
+→ `prepare_output_paths(labels)` → `reserved` set deduplication chain would not be caught. The
+analogous macOS gap was documented in 2026-06-15 (info); this finding is the distinct Linux path.
+_Suggested fix:_ Add an integration test using `_write_fake_tool` (following the pattern of
+`test_linux_viewable_window_passes_through`) for both xdotool (printing two IDs) and xprop
+(printing `window state: Normal` for each), then run the script subprocess with
+`--target window --allow-multiple-matches --destination desktop --dry-run --query Calculator`
+and assert two distinct `.png` paths are printed.
+
+---
+
+### Data leaks
+
+No new findings. The `CopyFromScreen` exception path (above) surfaces only a .NET Win32Exception
+message containing an OS error code and a static description — no window title metadata. The
+`Copy-Rectangle` GDI leak involves only pixel data in kernel-managed GDI memory, inaccessible to
+other processes. The `.isdigit()` widening and env-var guard gap involve no user data exposure.
+All previously documented title-privacy invariants continue to hold across all three platform paths.
+
+---
+
+### UX
+
+**[low] `CopyFromScreen` display-unavailable failure gives no actionable guidance (UX dimension of the Security finding above)**
+`capture_screenshot.ps1:241`
+A user running `--target fullscreen` or `--target active` in a Remote Desktop, Citrix, or headless
+Windows session receives exit code 1 and a multi-line .NET exception stack trace. The trace
+(`System.ComponentModel.Win32Exception: The handle is invalid`) gives no hint that the fix is to
+use a locally attached console session or to bring the session to the foreground. The `PrintWindow`
+path at least has `Test-BitmapAllBlack` that surfaces a user-readable warning; `CopyFromScreen` has
+no equivalent.
+_Suggested fix:_ Same as the Security entry above — catch `Win32Exception` around `CopyFromScreen`
+and emit a structured `window_not_capturable` message with display-session guidance before exiting
+with code 75.

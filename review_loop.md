@@ -1354,3 +1354,124 @@ no equivalent.
 _Suggested fix:_ Same as the Security entry above — catch `Win32Exception` around `CopyFromScreen`
 and emit a structured `window_not_capturable` message with display-session guidance before exiting
 with code 75.
+
+---
+
+## 2026-06-21
+
+### Security
+
+**[low] `install.sh` TOCTOU between existence checks and `git clone` in `clone_if_missing`**
+`install.sh:15–29`
+The three sequential existence guards (`[ -L "$dest" ]`, `[ -d "$dest" ]`, `[ -e "$dest" ]`) and
+the subsequent `git clone "$REPO" "$dest"` are not atomic. On a shared machine, a local attacker
+with write access to the parent skills directory (`$HOME/.claude/skills/`, etc.) could place a
+symlink at `$dest` in the window between `[ -e "$dest" ]` returning false and `git clone`
+executing. `git clone` follows the symlink and writes repository files into the symlink target
+(an attacker-chosen directory) rather than the intended skills location. Exploitation requires
+precise timing but no elevated privileges. This is the install-time analogue of the 2026-06-08
+`ensure_private_directory` TOCTOU and the 2026-06-13 `os.replace` symlink findings.
+_Suggested fix:_ After a successful `git clone`, add a post-clone symlink guard:
+`[ -L "$dest" ] && { echo "error: $dest is a symlink after clone — aborting"; exit 1; }`.
+Alternatively, note the residual race in a comment for shared-machine deployments.
+
+---
+
+### Bugs & regressions
+
+**[medium] `_linux_window_is_viewable` xprop path misclassifies windows on other virtual desktops as capturable**
+`capture_screenshot.py:374–383`
+`xprop -id N WM_STATE` reports `Window state: Normal` for windows that reside on other EWMH
+virtual desktops in common window managers (Openbox, XFWM, Mutter, i3). Such windows are not
+minimized (ICCCM Iconic state), so the check `"iconic" not in proc.stdout.lower()` returns
+`True` (capturable). Yet these windows are unmapped from the current display; ImageMagick
+`import -window <id>` called on them typically returns a black or stale cached image. The
+`xwininfo` fallback (lines 380–383) correctly uses `Map State: IsViewable`, which is `False`
+for unmapped off-desktop windows. However, because `xprop` is checked first (line 374:
+`if xprop:`) and its non-None result is returned immediately without falling through to
+`xwininfo`, systems where xprop is available silently receive an incorrect capture instead of
+a `window_not_capturable` error — even when xwininfo is also installed and would have
+identified the window as non-viewable.
+_Suggested fix:_ After the xprop WM_STATE check returns a "Normal" (non-Iconic) result, also
+query `_NET_WM_STATE` via `xprop -id N _NET_WM_STATE` and return `False` if `_NET_WM_STATE_HIDDEN`
+is present. Alternatively, always fall through to xwininfo as a cross-check whenever xprop
+returns "Normal", rather than short-circuiting. Add a test with a fake xprop emitting
+`window state: Normal` and a fake xwininfo emitting `Map State: IsUnMapped` to confirm the
+combined path returns `False`.
+
+**[low] `prepare_output_paths` creates the timestamped request directory before `plan_capture` runs, leaving empty directories on failed fullscreen and active-window captures**
+`capture_screenshot.py:623–633` (`main()`), `capture_screenshot.py:420–434` (`prepare_output_paths`)
+In `main()`, `prepare_output_paths(..., create=not args.dry_run)` is called before
+`plan_capture()`. For `--target fullscreen` (label `["screen"]` set at line 604) and for
+`--target active` on Linux where resolution succeeds but the tool check in `plan_capture`
+subsequently fails (e.g., no gnome-screenshot on a headless session), the request directory
+(`~/Desktop/screenshots/MM_DD_YYYY_HH_MM_SS/`) is created and secured on disk before the
+missing-tool error is returned. `execute_plan` then calls `die()`, leaving behind an empty
+timestamped directory. On systems where screenshot tools are absent or transiently unavailable,
+repeated failed attempts accumulate empty directories with no indication that cleanup is needed.
+For `--target window` the window resolution runs first and exits early on failure, so that
+path is less exposed; the gap mainly affects fullscreen captures on tool-absent systems.
+_Suggested fix:_ Move the `prepare_output_paths` call to after `plan_capture` returns a
+successful plan (i.e., `plan.ok` is True), so directories are only created when a capture is
+certain to proceed. Alternatively, clean up the request directory in `execute_plan`'s error
+path: if `not plan.ok` and the request dir was just created and is empty, remove it before
+calling `die()`.
+
+**[low] `Capture-ToDestination` `finally { $bitmap.Dispose() }` references an unset `$bitmap` when `Copy-Window` or `Copy-Rectangle` throws before returning**
+`capture_screenshot.ps1:295–349`
+`$bitmap` is assigned by calling `Copy-Window` or `Copy-Rectangle` (lines 309 and 314). If
+either function throws before returning — for example, from `[Drawing.Graphics]::FromImage` or
+`[Drawing.Bitmap]::new` as documented in the 2026-06-18 (`Copy-Window`) and 2026-06-20
+(`Copy-Rectangle`) GDI-leak findings — `$bitmap` is never assigned in `Capture-ToDestination`'s
+scope. The outer `try { ... } finally { $bitmap.Dispose() }` block then executes its `finally`
+clause with `$bitmap` unset. Under `Set-StrictMode -Version Latest`, referencing an unset
+variable throws "Variable is not set", which becomes a second terminating error under
+`$ErrorActionPreference = 'Stop'`. Depending on PowerShell version, this secondary error can
+mask the original GDI exception in the error record, making the root cause harder to diagnose
+in practice. The 2026-06-18 and 2026-06-20 entries documented GDI leaks inside the helper
+functions themselves; this finding is the companion issue at the caller.
+_Suggested fix:_ Initialize `$bitmap = $null` before the `Copy-Window`/`Copy-Rectangle`
+branch and guard the `finally` disposal: `if ($null -ne $bitmap) { $bitmap.Dispose() }`.
+This prevents the secondary unset-variable error and makes the cleanup logic explicit regardless
+of which allocation path was taken.
+
+---
+
+### Data leaks
+
+No new findings. The `_linux_window_is_viewable` misclassification (above) can cause a silent
+capture of an off-desktop window's pixel data, but the script output and filename derive only
+from the user's sanitized query — no actual window title is exposed through any output path.
+The install.sh TOCTOU involves file system layout only; no screenshot content or window title
+metadata is at risk. The `$bitmap` unset-variable issue involves only GDI pixel memory
+(inaccessible to other processes). All previously documented title-privacy invariants continue
+to hold across all three platform paths: error messages echo only user-supplied query text,
+`sanitize_label` strips URLs and non-alphanumeric content before embedding labels in paths,
+and the macOS helper never prints window titles to stdout or stderr.
+
+---
+
+### UX
+
+**[low] Empty timestamped directories accumulate silently on failed fullscreen captures**
+`capture_screenshot.py:623–633`, `capture_screenshot.py:420–434`
+(UX dimension of the Bugs entry above.) A user on a system without a supported screenshot tool
+who repeatedly attempts `--target fullscreen --destination desktop` receives a
+`missing_dependency_fullscreen` error each time, but also silently accumulates a new empty
+`~/Desktop/screenshots/MM_DD_YYYY_HH_MM_SS/` directory for every attempt. Nothing in the
+error output indicates these stale directories were created or that they need to be cleaned up.
+Over many retries (e.g., while installing the missing tool), the screenshots folder fills with
+empty timestamped directories.
+_Suggested fix:_ Same as the Bugs entry — defer directory creation to after plan validation, or
+remove empty request directories in the error exit path.
+
+**[info] `_linux_window_is_viewable` misclassification gives no warning; user receives a black or stale PNG with exit 0**
+`capture_screenshot.py:374–383`
+(UX dimension of the medium Bug entry above.) When a window on another virtual desktop is
+misclassified as capturable and `import -window <id>` is used, the tool exits 0 and writes a
+black or stale-content PNG to the output path. The Python script reports success (prints the
+path and exits 0). The user has no indication that the captured window was not on the current
+desktop and that the image content may be incorrect.
+_Suggested fix:_ Same as the Bug entry — cross-check with `xwininfo` Map State or
+`_NET_WM_STATE_HIDDEN` before classifying a window as capturable, so a
+`window_not_capturable` error is returned rather than a silent incorrect capture.

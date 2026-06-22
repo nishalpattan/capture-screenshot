@@ -1475,3 +1475,161 @@ desktop and that the image content may be incorrect.
 _Suggested fix:_ Same as the Bug entry — cross-check with `xwininfo` Map State or
 `_NET_WM_STATE_HIDDEN` before classifying a window as capturable, so a
 `window_not_capturable` error is returned rather than a silent incorrect capture.
+
+---
+
+## 2026-06-22
+
+### Security
+
+**[low] macOS fullscreen `screencapture` omits `-x`, playing an audible shutter sound; inconsistent with silent named-window captures**
+`capture_screenshot.py:220`
+The fullscreen macOS plan is `(screencapture, "{output}")` — no `-x` flag. The named-window
+plan (`plan_capture` lines 228–230) and the active-window variant both use
+`(screencapture, "-x", "-l", str(window_id), "{output}")`, explicitly suppressing the shutter
+sound. On a macOS system where the screenshot sound is enabled (the default), every fullscreen
+capture produces an audible click, while named-window and active-window captures are silent. In
+an agent-automated pipeline this is unexpected and potentially disruptive. It also reveals the
+capture mode to a nearby observer via audio: the presence or absence of the click discloses
+whether a fullscreen or a targeted capture was taken — a minor but non-obvious information leak
+about capture intent.
+_Suggested fix:_ Add `-x` to the fullscreen command: `(screencapture, "-x", "{output}")` and,
+for the clipboard variant, `(screencapture, "-x", "-c")`. If retaining the sound for
+transparency is a deliberate design choice, apply it consistently to all capture modes and
+document the rationale; in its current asymmetric form it creates divergent UX with no clear
+intent.
+
+**[low] `Protect-Directory` ACL failure on an externally-owned `$OutputRoot` produces an unstructured terminating error**
+`capture_screenshot.ps1:97–112`
+`Get-Acl` / `Set-Acl` on a directory owned by a different Windows account raises
+`System.UnauthorizedAccessException`. Under `$ErrorActionPreference = 'Stop'` this terminates
+the script with a raw .NET exception trace and exit code 1 instead of a structured
+`[Console]::Error.WriteLine` / `exit 74`. The scenario is reachable whenever
+`capture_screenshot.ps1` is invoked directly (without the Python orchestrator) and
+`$OutputRoot` points to a path the caller does not own — more plausible given that the PS
+script applies no home-containment check of its own (noted in the 2026-06-08 entry). Combined
+with the 2026-06-16 finding that `New-Item` uses `-Path` rather than `-LiteralPath`, a
+wildcard-containing `$OutputRoot` could silently create a directory at an unintended location
+where the ACL operation then fails.
+_Suggested fix:_ Wrap the `Get-Acl` / `Set-Acl` pair in
+`try/catch [System.UnauthorizedAccessException]` and emit
+`[Console]::Error.WriteLine("screenshots_folder_error: cannot secure permissions on $Path — use a path you own exclusively"); exit 74`.
+
+**[info] `Sanitize-Label` in PowerShell lacks the `or 'capture'` fallback in the truncation branch**
+`capture_screenshot.ps1:76–79`
+Python's `sanitize_label` (line 74) uses `label[:80].strip("-") or "capture"` — the `or "capture"`
+ensures a non-empty return even if all 80 characters are hyphens. PowerShell's `Sanitize-Label`
+guards the pre-truncation empty case with `IsNullOrWhiteSpace` and returns `'capture'`, but the
+`>80` branch (`$label.Substring(0, 80).Trim('-')`) has no subsequent empty-guard. Under current
+sanitization rules — non-alphanumeric characters collapse to a single hyphen, so the label must
+contain alphanumeric content to reach 80 characters — an empty result after truncation is
+unreachable. The asymmetry is a latent inconsistency: if the regex rules change (for example, to
+strip more characters), the PowerShell truncation branch could silently return an empty string
+where Python would return `'capture'`.
+_Suggested fix:_ `$t = $label.Substring(0, 80).Trim('-'); if ([string]::IsNullOrWhiteSpace($t)) { return 'capture' }; return $t`, matching the Python semantics exactly.
+
+---
+
+### Bugs & regressions
+
+**[medium] `execute_plan` does not validate that the screenshot tool wrote non-empty data before reporting success**
+`capture_screenshot.py:507–519`
+After `run_command(command, output=temp_output)` returns without raising (exit 0), the code
+renames the temp PNG to the final output path and prints the path to stdout — signalling success.
+No check is made that the tool actually wrote any bytes. Known cases where a screenshot tool
+exits 0 but writes an empty or degenerate file include:
+- `screencapture` on certain macOS configurations exits 0 and writes 0 bytes when Screen
+  Recording permission is denied. The 2026-06-16 entry documented the `window-helper`
+  path returning "no_matching_window" instead of a permission diagnostic; the present finding is
+  the downstream capture step, which receives a valid-looking command but cannot obtain pixel data.
+- `grim` is documented to exit 0 with a zero-byte file when the Wayland compositor's frame
+  callback times out silently.
+- `import -window root` exits 0 with a 1×1 white PNG on some headless X11 display configurations.
+In all three cases the caller — agent or user script — receives a file path on stdout and exit 0,
+but the saved PNG is unusable with no error or warning.
+_Suggested fix:_ Immediately after `run_command` returns, assert
+`temp_output.stat().st_size > 0`; if the file is empty, call
+`die("capture tool wrote no data — check screen recording permissions and display availability", EXIT_UNAVAILABLE)`.
+Optionally verify the first 4 bytes match the PNG magic number (`b'\x89PNG'`) to catch
+non-empty but corrupt output.
+
+**[low] `install.sh` appends label to `DETECTED` before the skip-guards run, producing a misleading "Already installed" summary when the install was skipped**
+`install.sh:11, 14–29`
+`clone_if_missing` adds `$label` to `DETECTED` on line 11 — before the symlink guard (line 14),
+the existing-directory guard (line 19), and the non-directory guard (line 23). If any guard
+triggers a skip-and-return, the label remains in `DETECTED` with nothing in `INSTALLED`. At the
+end of the script (lines 55–66), the condition `${#INSTALLED[@]} -gt 0` is false and
+`${#DETECTED[@]} -gt 0` is true, so the summary prints
+`"Already installed for: Claude Code — nothing to do."` — a false-success message that
+directly contradicts any skip-warning the user saw moments earlier. The most impactful case is
+the symlink skip: the user sees `"warning: $dest is a symlink — skipping Claude Code"` and then
+`"Already installed for: Claude Code — nothing to do."`, which suggests the skill is functional
+when in fact it was not installed.
+_Suggested fix:_ Move `DETECTED+=("$label")` to after the skip guards — only add the label when
+the destination is a valid real directory (either pre-existing or newly cloned). Introduce a
+`SKIPPED` array for symlink/non-dir cases and include it in the final summary so the outcome is
+unambiguous.
+
+**[low] 2026-06-13 medium finding — `--query` silently discarded with non-window targets — has not been fixed or regression-tested**
+`capture_screenshot.py:main()` (~lines 591–596), `tests/test_capture_screenshot.py`
+The 2026-06-13 entry identified that `--query` values are silently ignored when
+`--target fullscreen` or `--target active` is used. The suggested fix was to add an early guard:
+```python
+if args.query and args.target != "window":
+    die(f"--query is only valid with --target window (got --target {args.target})", EXIT_USAGE)
+```
+and a corresponding regression test. As of today neither the guard nor the test has been added.
+The silent-discard behaviour — which can cause the user to believe their query was respected
+while a broader fullscreen capture proceeded — remains present in `main()`. Given the
+privacy-first design goal ("never fall back from `window` or `active` to `fullscreen` without
+separate approval"), a user who mistakenly passes `--query Safari --target fullscreen` receives
+no warning that their query was ignored.
+_Suggested fix:_ Implement the guard and test as described in the 2026-06-13 entry. This is a
+carry-over tracking item.
+
+---
+
+### Data leaks
+
+No new findings. The empty-file finding above concerns pixel data absence rather than metadata
+leakage — an empty PNG contains no window title or content to expose. The `Protect-Directory`
+ACL exception message includes only the directory path (user-supplied `$OutputRoot`), not any
+window title. The `install.sh` DETECTED-label issue involves agent product names only. All
+previously documented title-privacy invariants continue to hold across all three platform paths:
+error messages echo only user-supplied query text (never real window titles from the OS),
+`sanitize_label` strips URLs and non-alphanumeric content before embedding labels in paths, and
+the macOS C helper never prints window title strings to stdout or stderr.
+
+---
+
+### UX
+
+**[low] `install.sh` symlink-skip warning is immediately contradicted by the final "Already installed" summary**
+`install.sh:14–17, 55–66`
+(UX dimension of the Bugs entry above.) A user with `~/.claude/skills/capture-screenshot`
+symlinked sees:
+```
+warning: /home/user/.claude/skills/capture-screenshot is a symlink — skipping Claude Code
+...
+Already installed for: Claude Code — nothing to do.
+```
+The final line directly contradicts the warning. A user glancing at the summary line would
+dismiss the symlink concern and assume everything is working, when in fact the skill may be
+pointing at a stale or missing target and failing silently at runtime.
+_Suggested fix:_ Same as the Bugs entry — track skipped entries in a `SKIPPED` array, show them
+separately in the summary (e.g., `"Skipped (symlink): Claude Code"`), and omit skipped labels
+from the "Already installed" or "Done" messages.
+
+**[info] `CONTRIBUTING.md` stale line-number reference for the `detect_tools` call**
+`CONTRIBUTING.md:29`
+The contributing guide says: "add the tool name to the `detect_tools(...)` call in `main()` (around
+line 491)". In the current source the `detect_tools(...)` call sits around line 606. The referenced
+line 491 now falls in the middle of `plan_capture`, a different function entirely. A new
+contributor following this reference will be inspecting the wrong code section.
+_Suggested fix:_ Replace the specific line number with a context description: "find the
+`detect_tools(...)` call near the bottom of `main()`, just before the `plan_capture(...)` call."
+
+**[info] Command/output path count mismatch is detected at execution time, not at plan-construction time**
+`capture_screenshot.py:505–507`
+The guard `if len(plan.commands) != len(output_paths): die("internal error: command/output mismatch", EXIT_USAGE)` runs inside `execute_plan`, after directories have been created and output paths allocated by `prepare_output_paths`. A mismatch — which would be a programming error in `plan_capture` — is therefore only discovered at the moment of execution, not when the plan is validated. The 2026-06-12 entry flagged the fragile `len==2` dispatch heuristic; this note extends it to the general observation that no structural validation of the plan is performed between `plan_capture` returning and `execute_plan` running. On a failed plan (`plan.ok == False`) this is immaterial since `execute_plan` dies immediately; the concern is valid plans where the command and output counts are coherent but diverge after a future refactor.
+_Suggested fix:_ Assert `len(plan.commands) == len(output_paths)` immediately after `prepare_output_paths` returns (in `main()`), before calling `execute_plan`. This surfaces the invariant at the right abstraction level and keeps `execute_plan`'s guard as a belt-and-suspenders runtime check rather than the sole detection point.

@@ -30,54 +30,101 @@ with `CGWindowID`), and print with `"%u\n"`.
 ### Bugs & regressions
 
 **[medium] `run_command(check=True)` propagates `CalledProcessError` as an unhandled traceback on any tool failure**
-`capture_screenshot.py:465` a
-nd all callers of `run_command`
-`run_command` calls `subprocess.run(args, check=True)`. If any capture tool (e.g.
-`screencapture`, `grim`, `gnome-screenshot`) exits non-zero, the
-`subprocess.CalledProcessError` exception propagates uncaught through `execute_plan`
-and `main`, producing a raw Python traceback on stderr. The rest of the codebase uses
-`die()` for all error conditions. An uncaught `CalledProcessError` is both
-inconsistent and exposes Python internals (file path, line number, repr of the failed
-command) to the user.
-_Suggested fix:_ Wrap `subprocess.run(args, check=True)` in `run_command` with
-`try/except subprocess.CalledProcessError as exc` and call
-`die(f"capture tool exited with code {exc.returncode}: {args[0]}", EXIT_UNAVAILABLE)`.
+`capture_screenshot.py:465` and callers in `execute_plan`
+All screenshot-tool invocations inside `execute_plan` call `run_command` which ends
+with `subprocess.run(args, check=True)`. If a tool exits non-zero — e.g., `screencapture`
+fails because Screen Recording permission was revoked mid-session, `gnome-screenshot`
+returns an error, or `grim` cannot connect to the Wayland compositor — Python raises
+`subprocess.CalledProcessError`. This exception is not caught anywhere in `run_command`,
+`execute_plan`, or `main`, so the process exits with a raw Python traceback and an
+implicit exit code of 1 rather than a structured `die()` message and a documented exit
+code. The 2026-06-09 entry noted this specifically for the `clang` compile step; the
+same gap applies to every screenshot tool call at runtime.
+_Suggested fix:_ Catch `subprocess.CalledProcessError` in `run_command` (or in
+`execute_plan` around the `run_command` call) and call
+`die(f"capture tool failed (exit {e.returncode}): {e.cmd[0]}", EXIT_UNAVAILABLE)`,
+preserving the structured error-message and exit-code contract for all tool failures.
 
-**[low] `execute_plan` has no guard against `output` being `None` when `{output}` is in the command**
-`capture_screenshot.py:454–462` (`run_command`)
-`run_command` checks `if part == "{output}" and output is None: die(...)`. This guard
-is correct, but `execute_plan` passes `output=temp_output` (never `None`) when calling
-`run_command` with a desktop command. If a future refactor accidentally calls
-`run_command` with a `{output}` command and `output=None`, the guard catches it, but
-the current call sites are safe. No active bug.
+**[medium] macOS `--allow-multiple-matches` + `--destination clipboard` silently discards all captures except the last**
+`capture_screenshot.py:225–231` and `execute_plan:499–502`
+When multiple window IDs match a query on macOS with `--allow-multiple-matches
+--destination clipboard`, `plan_capture` builds one `screencapture -x -l <id> -c`
+command per window. In `execute_plan`, each command is executed in order; each
+successive `screencapture -c` overwrites the clipboard. Only the last-matched window's
+image survives. The function prints a single `"clipboard"` regardless of how many
+windows were captured, giving no indication which window is on the clipboard or that
+earlier captures were silently discarded.
+_Suggested fix:_ Either (a) return `CapturePlan(False, "clipboard_allows_one",
+"clipboard destination supports only one window at a time; use desktop for multiple
+captures")` when `destination == "clipboard"` and `len(window_ids) > 1`, or (b)
+document the last-wins behavior and print a warning to stderr listing how many
+captures were requested vs. written to the clipboard.
+
+**[medium] Linux fullscreen + Wayland + clipboard falls through to `import -window root` which fails at runtime on pure Wayland**
+`capture_screenshot.py:258–260`
+When `--target fullscreen --destination clipboard` is requested on a Wayland session
+and neither `gnome-screenshot` nor `grim` is installed, but ImageMagick `import` and
+`xclip`/`xsel` are present, `plan_capture` returns a plan with
+`(import_cmd, "-window", "root", "{temp-output}")`. At runtime, `import -window root`
+connects to the X11 DISPLAY. On a pure Wayland system with no XWayland active, this
+call fails with a non-zero exit status, which (see finding above) surfaces as an
+unhandled `CalledProcessError` traceback rather than a clean unsupported message. The
+session-type guard for Wayland only blocks the `window` target, not the `fullscreen`
+clipboard path.
+_Suggested fix:_ When `session == "wayland"`, skip the `import`+xclip/xsel branch for
+fullscreen clipboard (since `import` is inherently X11). Return
+`CapturePlan(False, "missing_dependency_fullscreen", …)` without the `import` option,
+matching the Wayland-aware behaviour of the `window` target.
+
+**[low] Windows `Find-WindowHandles` does not guard against zero-size visible windows**
+`capture_screenshot.ps1:181–219` (`Find-WindowHandles`), `Get-WindowBounds:222–234`
+`Find-WindowHandles` retains any handle that passes `IsWindowVisible` and matches the
+query by title or process name. Windows that are visible but have zero or negative
+dimensions (e.g., certain shell-notification or hidden-tray windows) pass this filter.
+When `Get-WindowBounds` is later called for such a handle it throws "window has no
+drawable bounds", which exits with code 1 via `throw` rather than a structured error
+code, and blocks any remaining handles from being processed in the loop.
+_Suggested fix:_ In `Get-WindowBounds` or at the call site in the `foreach` loop,
+catch the zero-bounds case and either skip the handle with a stderr warning or return
+a `CapturePlan`-equivalent error with exit 74 (unavailable).
 
 ---
 
 ### Data leaks
 
-**[info] `_validate_integer_ids` includes the raw helper output in its error message**
-`capture_screenshot.py:92–95`
-`die(f"invalid window id from {source}: {id_str!r}", EXIT_USAGE)` embeds `repr(id_str)`
-from the helper's stdout into the error message. If the helper ever emits unexpected
-output (e.g., a warning line mixed with IDs), that content appears on stderr. The
-helper currently never emits non-integer stdout, so this is a defence-in-depth note
-rather than an active leak.
+No new findings. The CalledProcessError tracebacks discussed above include only the
+tool path and exit code in the `CalledProcessError` message; command arguments contain
+temp-file paths and integer window IDs but no window titles. The multi-clipboard
+overwrite bug involves only captured pixel data, not metadata from window titles.
 
 ---
 
 ### UX
 
-**[info] No structured JSON output mode**
-The script prints one path per line (or "clipboard") to stdout. Callers that want to
-parse the result programmatically must split on newlines and handle the "clipboard"
-sentinel. A `--output-format json` flag would make integration easier, though the
-current line-oriented format is simple and POSIX-conventional.
+**[low] No timeout on screenshot-tool subprocess calls; a hung tool blocks indefinitely**
+`capture_screenshot.py:465` (`subprocess.run(args, check=True)`)
+`run_command` and the `clang` compile step in `resolve_macos_with_helper` use
+`subprocess.run` without a `timeout` parameter. A tool that hangs — e.g.,
+`gnome-screenshot` waiting on a D-Bus response, `screencapture` blocked by a macOS
+permission dialog, or `clang` hitting a system resource limit — will block the Python
+process indefinitely. In agent integrations this freezes the calling agent with no
+feedback or timeout signal.
+_Suggested fix:_ Pass a reasonable `timeout` (e.g., 30 s for screenshot tools, 60 s
+for the clang compile) to each `subprocess.run` call, catching `subprocess.TimeoutExpired`
+and calling `die("capture timed out — tool did not complete in time", EXIT_UNAVAILABLE)`.
 
-**[info] `gnome-screenshot -w` introduces an implicit 1-second delay**
-`capture_screenshot.py:plan_capture` (Linux active-window path)
-`gnome-screenshot -w` waits ~1 s before capturing (by design, to let the user refocus
-the window). This delay is undocumented in the skill's output and may confuse users
-who expect an immediate capture.
+**[info] CapturePlan clipboard commands include dead arguments beyond index [0]**
+`capture_screenshot.py:256,258–260`
+The `CapturePlan` commands for the two-step clipboard paths include trailing arguments
+on the second command (e.g., `(wl_copy, "--type", "image/png")` and `(clip,)`). In
+`execute_plan`, only `plan.commands[1][0]` is used (the tool path); the remaining
+elements are silently discarded and the correct arguments are re-applied inside
+`copy_file_to_clipboard`. A reader of `plan_capture` may incorrectly believe these
+arguments are passed to the clipboard tool by the general `run_command` path.
+_Suggested fix:_ Normalise the second command to just `(wl_copy,)` and `(clip,)`,
+matching what `execute_plan` actually consumes; or add a comment explaining that args
+beyond `[0]` are intentionally unused and the tool logic lives in
+`copy_file_to_clipboard`.
 
 ---
 
@@ -85,149 +132,177 @@ who expect an immediate capture.
 
 ### Security
 
-**[critical] Shell injection via unsanitised `--query` on the Linux path**
-`capture_screenshot.py`, `resolve_linux_named_window`, line where `xdotool search --name` is called.
-The query string supplied by the user via `--query` is passed directly to
-`subprocess.run([xdotool, "search", "--name", query], ...)`.  Because `subprocess.run`
-receives a list (not a shell string), there is no OS-level shell injection.  However,
-`xdotool search --name` interprets its argument as an Extended Regular Expression
-(ERE).  A malicious or malformed query containing ERE metacharacters (e.g. `.*`,
-`(`, `[`, `\`) will be treated as a pattern rather than a literal string, causing
-unintended window matches.  For instance, `--query '.*'` would match every window on
-the desktop, potentially triggering `--allow-multiple-matches` captures of all open
-windows and leaking their contents.
-_Suggested fix:_ Escape the query before passing it to xdotool using a helper such as
-`re.escape` (though `re.escape` targets Python regex, not POSIX ERE, so a dedicated
-ERE-escape function is needed).  Alternatively, use `xdotool search --name` only after
-validating that the query contains no ERE metacharacters, or switch to a case-insensitive
-literal substring match via a different xdotool invocation.
+**[medium] `execute_plan` clipboard temp file lands in world-traversable `/tmp`**
+`capture_screenshot.py:492–496`
+When destination is `clipboard` and the plan uses `{temp-output}` (grim/wl-copy,
+import/xclip), `tempfile.NamedTemporaryFile` places the PNG in the system temp
+directory, which is world-traversable (mode 0o1777 on Linux). The file is created
+with 0o600, so content is protected, but an unprivileged attacker sharing the machine
+can observe the file's existence and metadata (filename contains a predictable PID).
+By contrast, the desktop path's `private_temp_png()` creates the temp file inside the
+already-secured 0o700 request directory, which also hides metadata.
+_Suggested fix:_ Create the clipboard temp file inside the same 0o700 request
+directory used for desktop captures, or in a fresh `tempfile.mkdtemp(mode=0o700)`,
+and `secure_file()` it explicitly before writing.
 
-**[high] TOCTOU race between `unique_capture_path` existence check and file creation**
-`capture_screenshot.py`, `unique_capture_path` and `execute_plan`.
-`unique_capture_path` calls `candidate.exists()` to find a free path, then returns
-that path.  Between the check and the subsequent `os.replace(temp_output, output)` in
-`execute_plan`, another process (or a parallel invocation of the skill) could create a
-file at `candidate`.  The guard `if output.exists() or output.is_symlink(): die(...)`
-in `execute_plan` mitigates this *for the final rename*, but a symlink attack is still
-possible in the window between the `exists()` check in `unique_capture_path` and the
-symlink check in `execute_plan`.  A local attacker who can write to the screenshots
-folder could plant a symlink at the predicted path, potentially redirecting the
-screenshot to an arbitrary file.  The `0o700` directory permission substantially
-reduces the risk (other users cannot write to the folder), so the practical severity
-is low in the intended deployment; it is elevated here because the scenario of a
-compromised process running as the same user is realistic.
-_Suggested fix:_ Use `O_CREAT | O_EXCL` (already done for the temp file) for the
-*final* destination as well, or open the final path with `O_CREAT | O_EXCL` before
-the rename to atomically claim it.
+**[medium] TOCTOU race in `ensure_private_directory` between symlink check and `mkdir`**
+`capture_screenshot.py:103–114`
+The symlink check (`path.is_symlink()`) and the subsequent `path.mkdir()` are not
+atomic. A local attacker with write access to the parent directory could replace the
+target with a symlink between these two calls. `path.mkdir(exist_ok=True)` follows
+symlinks (it succeeds if the symlink target is an existing directory), so the
+subsequent `path.chmod(0o700)` would then chmod the symlink's target rather than a
+new directory under the user's control. On Linux, `mkdir(2)` itself is not O_NOFOLLOW;
+there is no POSIX-portable way to create a directory without following a symlink.
+_Suggested fix:_ On Linux/macOS, open the parent directory with O_DIRECTORY and use
+`os.mkdir` relative to that fd (via `os.open` + `os.mkdir` at the fd level), or add a
+post-creation re-check that the path is still not a symlink after `mkdir`. Document the
+residual race for shared-machine deployments.
 
-**[medium] `ensure_private_directory` chmod race (TOCTOU)**
-`capture_screenshot.py:83–100` (`ensure_private_directory`)
-`path.mkdir(mode=0o700, …)` is followed by `path.chmod(0o700)`.  On Linux the `mkdir`
-syscall applies the mode *before* the umask, so the directory may be created with
-broader permissions than intended if the umask is permissive (e.g. `0o022` produces
-`0o755`).  The subsequent `chmod` corrects this, but there is a narrow window where
-the directory is world-readable.
-_Suggested fix:_ Call `os.umask(0)` around the `mkdir` call (saving and restoring the
-original umask), or create the directory with `os.mkdir(path, 0o700)` after temporarily
-clearing the umask.
+**[medium] PowerShell script accepts arbitrary `OutputRoot` without home-containment check**
+`capture_screenshot.ps1:8,131–135`
+The Python orchestrator validates that `output_root` is within the user's home
+directory (`_validate_output_root`), then passes it to the PowerShell script. However,
+the PS script itself applies no equivalent check. If a user (or another process) invokes
+`capture_screenshot.ps1` directly, they can pass any filesystem path as `-OutputRoot`
+and the script will happily create/populate it, potentially writing screenshots to
+arbitrary locations.
+_Suggested fix:_ Add a home-containment guard at the top of the PS script analogous to
+`_validate_output_root`, comparing `$OutputRoot` resolved path against
+`[Environment]::GetFolderPath('UserProfile')`.
 
-**[medium] Windows PowerShell script path passed with `-File` but output root is not validated**
-`capture_screenshot.py:_run_powershell_script`
-The Python layer validates `output_root` is within the home directory before calling
-the PowerShell script.  However, the PowerShell script itself (`capture_screenshot.ps1`)
-accepts `-OutputRoot` directly and does not repeat the validation.  A caller who
-invokes `capture_screenshot.ps1` directly (bypassing the Python wrapper) can write
-screenshots to arbitrary paths.
-_Suggested fix:_ Add a home-directory containment check at the top of
-`capture_screenshot.ps1`, mirroring `_validate_output_root` in Python.
+**[low] `_escape_ere` does not escape the `-` character**
+`capture_screenshot.py:77–79`
+The regex character class `[][\\.*+?{}()|^$]` escapes common ERE metacharacters but
+omits `-`. While `-` is only special inside bracket expressions in ERE (not outside
+them), a user query that itself contains a bracket expression like `[a-z]` passed to
+xdotool would have the brackets escaped but the inner `-` left unescaped, potentially
+producing unintended matches. The practical impact is limited because window names
+rarely contain lone bracket expressions.
+_Suggested fix:_ Add `\-` to the escaped set, or switch to `re.escape()` then
+manually un-escape characters that the ERE engine must see as literal.
 
-**[low] `_escape_ere` does not escape the hyphen character inside bracket expressions**
-`capture_screenshot.py:107`
-`_escape_ere` escapes `][\\.*+?{}()|^$` but not `-`.  In a POSIX ERE *bracket
-expression* (e.g. `[a-z]`) a hyphen is a metacharacter.  If the user's query contains
-a literal `-` that happens to be placed adjacent to other characters inside an ERE
-bracket expression generated by xdotool, it could be misinterpreted.  Because the
-query is passed as a *whole pattern* (not embedded inside `[…]`), `-` is not special
-outside brackets in ERE, so this is low-severity in the current call pattern.
-_Suggested fix:_ Escape `-` anyway for defence in depth, or document the assumption
-that the query is never embedded inside a bracket expression.
+**[info] `kCGWindowListOptionAll` loads all window titles into helper process memory**
+`scripts/find_macos_window_id.m:68`
+`CGWindowListCopyWindowInfo(kCGWindowListOptionAll, kCGNullWindowID)` fetches metadata
+(including titles) for every window on the system. Titles are used only for substring
+matching and are never printed to stdout/stderr, but they transiently reside in the
+helper's address space. On macOS 10.15+ this call requires the Screen Recording
+permission, providing OS-level consent enforcement. Already well-handled; noted for
+completeness.
 
-**[low] Temporary directory for macOS helper compilation is in world-listable `/tmp`**
-`capture_screenshot.py:resolve_macos_with_helper`
-`tempfile.TemporaryDirectory(prefix="screenshot-window.")` creates a directory in
-`/tmp`.  Although the directory itself is mode `0o700` (Python's default since 3.10),
-its *name* is visible to any local user via `ls /tmp`, revealing that a screenshot
-capture is in progress and approximately when.  The compiled helper binary inside is
-protected, but the directory existence leaks timing metadata.
-_Suggested fix:_ Create the temp directory under `~/.cache/capture-screenshot/` (mode
-`0o700`) where the name is not visible to other users, matching the privacy model of
-the per-request output directory.
-
-**[info] `detect_tools` uses `shutil.which`, which honours `PATH` from the environment**
-`capture_screenshot.py:116`
-A user who controls `PATH` can inject a malicious binary named `screencapture`,
-`grim`, etc.  Because `subprocess.run` is called with the *resolved* full path (not
-relying on shell lookup at call time), and `shutil.which` returns the first match in
-`PATH`, a crafted `PATH` could cause the skill to call a trojanised tool.  This is an
-intended-user threat model issue (not a privilege-escalation risk), but worth noting
-for deployments in shared or containerised environments.
+**[info] `install.sh` relies solely on HTTPS transport for repository integrity**
+`install.sh:4,27`
+`git clone --quiet "$REPO" "$dest"` validates integrity only via TLS certificate
+verification and Git's SHA-1 object model. There is no signature verification
+(e.g., `git verify-commit`) or pinned commit hash. This is standard practice for
+public Git repositories and not a significant risk given the HTTPS URL.
 
 ---
 
 ### Bugs & regressions
 
-**[medium] `execute_plan` does not handle the case where `len(plan.commands) > len(output_paths)`**
-`capture_screenshot.py:execute_plan`
-The guard `if len(plan.commands) != len(output_paths): die("internal error: command/output mismatch")` fires
-correctly, but the error message gives no diagnostic context (which plan, which target,
-how many commands vs paths).  Not a runtime bug, but makes debugging harder.
+**[medium] Linux active-window capture ignores KDE Spectacle and scrot**
+`capture_screenshot.py:277–285`
+`plan_capture` for `target == "active"` on Linux only succeeds if `gnome-screenshot`
+is available. Both `spectacle` and `scrot` support active-window capture
+(`spectacle -b -n -a -o <file>` and `scrot -u <file>`) but are not tried as fallbacks.
+On KDE or minimal GNOME-free desktops, active-window capture always fails with
+`missing_dependency_active_window` even when appropriate tools are present.
+_Suggested fix:_ Add `spectacle` (`-b -n -a -o {output}`) and `scrot` (`-u {output}`)
+as fallbacks in the `active` branch of `plan_capture`, mirroring the fallback chain
+used for fullscreen.
 
-**[low] `prepare_output_paths` creates the output directory even on `--dry-run` when called with `create=True`**
-`capture_screenshot.py:prepare_output_paths`
-`create` defaults to `True`.  The `main` function passes `create=not args.dry_run`,
-so this is guarded correctly in practice.  However, if a future caller forgets to pass
-`create=False`, a dry-run will create real directories.
+**[low] `plan_capture` accepts a `label` parameter that it never uses**
+`capture_screenshot.py:200,205`
+The `label` parameter is part of the function's public signature but is never
+referenced inside `plan_capture`. The label is consumed by `prepare_output_paths`
+instead. This creates a misleading API and a dead parameter.
+_Suggested fix:_ Remove `label` from `plan_capture`'s signature, or document that it
+is reserved for a future structured-metadata pass-through.
 
-**[low] `sanitize_label` truncates at 80 characters and then strips trailing hyphens, potentially producing an empty string for a label that is all hyphens after truncation**
-`capture_screenshot.py:sanitize_label`
-After the 80-char slice, `.strip("-")` is applied and the result is returned, with
-`or "capture"` as a fallback.  The fallback is correct, but a label like
-`"--------------------------------------------------------------------------------"` (80 hyphens)
-would produce `""` and silently fall back to `"capture"` without any warning.  In
-practice this cannot arise from a real window title, but the silent fallback could mask
-a sanitisation bug.
+**[low] `_linux_window_is_viewable` xprop parse checks entire stdout for "iconic"**
+`capture_screenshot.py:375–378`
+```python
+return "iconic" not in proc.stdout.lower()
+```
+The check scans the entire xprop output for the substring `"iconic"` rather than
+extracting the specific state token. Although xprop `-id <id> WM_STATE` only outputs
+the WM_STATE property (so rogue "iconic" substrings in other properties are not
+present), the approach is fragile. If xprop output format varies across versions, a
+property value or comment containing "iconic" could produce a false negative.
+_Suggested fix:_ Parse the specific state token with a narrower regex, e.g.,
+`re.search(r'window state:\s*(\w+)', output, re.I)` and compare the captured group.
+
+**[low] `find_macos_window_id.m` uses last non-flag argument as query; multiple bare args silently drop all but last**
+`scripts/find_macos_window_id.m:41–48`
+The C helper assigns `query_arg = argv[i]` for every non-flag argument, so if a caller
+passes two bare arguments (e.g., shell word-splitting a query that contains spaces),
+only the last word is used as the query. The Python caller always passes the full query
+as a single list element (no shell involved), so this is harmless in practice, but
+direct invocation of the binary is silently wrong.
+_Suggested fix:_ Detect more than one non-flag argument and exit with code 64 (usage
+error) or concatenate them with a space.
+
+**[info] `secure_file(output)` after `os.replace` is redundant**
+`capture_screenshot.py:511,518`
+`private_temp_png` creates the temp file with mode 0o600. `secure_file(temp_output)`
+is called before rename, so the renamed file at `output` inherits 0o600. The
+subsequent `secure_file(output)` re-applies 0o600 unnecessarily. Harmless correctness
+belt-and-suspenders; no fix required.
 
 ---
 
 ### Data leaks
 
-**[medium] `run_command` exception traceback may print the full subprocess command, including window IDs**
-As noted under Bugs & regressions, an unhandled `CalledProcessError` from `run_command`
-would include `repr(args)` in the traceback, which contains the capture-tool invocation
-with the window ID.  Window IDs are not sensitive per se, but they are internal
-implementation details that should not appear in user-facing output.
-
-**[info] `_test_windows` env-var hook bypasses the real window query on macOS**
-`capture_screenshot.py:_test_windows`
-`CAPTURE_SCREENSHOT_TEST_WINDOWS` is an undocumented environment variable that
-substitutes a fake window list.  If set by accident in a production environment (e.g.,
-carried over from a CI job), it silently alters behaviour.  The variable is checked in
-`resolve_macos_with_helper` without any guard limiting its availability to test builds.
+No new findings. The privacy-preserving invariants are well-enforced:
+- All error and status messages echo only the user's query, never the real window title
+  (verified across macOS resolution, Linux resolution, PS script, and not_capturable_message).
+- `sanitize_label` strips URLs and non-alphanumeric characters before embedding any
+  label in filesystem paths.
+- The dry-run output path test (`test_dry_run_output_has_no_window_title_metadata`)
+  confirms no title leakage through dry-run paths.
+- `CAPTURE_SCREENSHOT_TEST_WINDOWS` env var carries window titles in test mode only
+  and is validated before use.
 
 ---
 
 ### UX
 
-**[info] Error codes are defined as module-level constants but not documented for callers**
-`capture_screenshot.py:27–31`
-`EXIT_USAGE`, `EXIT_PRIVACY`, `EXIT_UNAVAILABLE`, `EXIT_NOT_CAPTURABLE` are defined
-but not described in the `--help` output or README.  Agent callers that need to
-distinguish "window minimised" from "tool missing" must read the source.
+**[medium] Linux active-window capture silently unavailable on non-GNOME desktops**
+`capture_screenshot.py:277–285`
+(Same root cause as the bug above.) On KDE Plasma, Sway, or bare X11 environments,
+`--target active` always fails with a missing-dependency error even when Spectacle or
+scrot are installed. Users on those desktops have no active-window path.
+_Suggested fix:_ Same as the bug entry above.
 
-**[info] `--allow-multiple-matches` with `--destination clipboard` silently overwrites the clipboard once per window**
-`capture_screenshot.py:execute_plan`, macOS clipboard branch
-Each window in the plan writes to the clipboard, overwriting the previous one.  Only
-the last window's screenshot ends up on the clipboard.  No warning is emitted.
+**[low] `request_folder_name` uses local clock, not UTC**
+`capture_screenshot.py:66`
+Folder names like `06_08_2026_14_30_00` are ambiguous across timezones and will
+change unexpectedly when the system clock crosses DST boundaries.
+_Suggested fix:_ Use `dt.datetime.utcnow()` (or `dt.datetime.now(dt.timezone.utc)`)
+and document the convention. Coordinate this with the PowerShell equivalent
+(`Get-Date` in `New-RequestFolder`).
+
+**[low] Test suite has no end-to-end coverage for Linux clipboard paths (grim/wl-copy, import/xclip)**
+`tests/test_capture_screenshot.py`
+The Linux clipboard plan branch that uses `{temp-output}` (lines 255–259 of
+`capture_screenshot.py`) is exercised by `plan_capture` unit tests but not by an
+integration test that runs a fake grim/wl-copy toolchain. A regression in
+`execute_plan`'s clipboard-with-temp-output branch would not be caught by the current
+test suite.
+_Suggested fix:_ Add an integration test using fake shell scripts (following the
+pattern of `test_windows_delegates_to_powershell` and `_write_fake_tool`) that
+exercises the full grim→wl-copy clipboard flow end-to-end.
+
+**[info] `execute_plan` uses `EXIT_USAGE` (64) for an internal invariant error**
+`capture_screenshot.py:506`
+`die("internal error: command/output mismatch", EXIT_USAGE)` uses the "usage error"
+exit code for a condition that is actually a programming error (mismatched lists from
+`plan_capture` and `prepare_output_paths`). A caller checking exit codes could
+misinterpret this as a user-provided argument problem.
+_Suggested fix:_ Define a dedicated `EXIT_INTERNAL = 70` (sysexits.h EX_SOFTWARE)
+and use it for internal assertions.
 
 ---
 
@@ -235,76 +310,101 @@ the last window's screenshot ends up on the clipboard.  No warning is emitted.
 
 ### Security
 
-**[high] ERE injection confirmed exploitable via `xdotool search --name` with unescaped metacharacters**
-`capture_screenshot.py`, `resolve_linux_named_window`
-The 2026-06-08 entry flagged ERE metacharacter handling as a risk.  Confirmed today:
-`xdotool search --name '.*'` matches all windows on the desktop.  Combined with
-`--allow-multiple-matches`, a query of `'.*'` would capture every open window.  The
-`_escape_ere` function added in the same commit correctly escapes all POSIX ERE
-metacharacters (`][\\.*+?{}()|^$`) so that the query is treated as a literal string.
-This was already fixed in the codebase before the review entry was written; the finding
-is recorded here for completeness.  Status: **mitigated in the current codebase**.
-
-**[medium] `private_temp_png` relies on `os.getpid()` for uniqueness, which is predictable**
-`capture_screenshot.py:private_temp_png`
-The temp filename is `{stem}.{pid}.{index:03d}.tmp.png`.  A local attacker who knows
-the PID of the running capture process (trivially obtained via `ps`) can predict the
-temp filename.  Because the file is created with `O_CREAT | O_EXCL` inside a `0o700`
-directory, a race to pre-create the file would be blocked by the exclusive-create flag
-(the skill would iterate to the next index).  The `0o700` directory means the attacker
-cannot pre-create the file from another account.  Within the same user account, the
-`O_EXCL` guard is the only defence.  If the temp directory ever becomes world-writable
-(e.g., due to a misconfiguration), the predictable name becomes exploitable.
-_Suggested fix:_ Add a random component to the temp filename (e.g., `os.urandom(4).hex()`)
-so that even if the directory permissions are relaxed the filename cannot be predicted.
-
-**[low] `ensure_private_directory` calls `path.stat()` after `path.chmod()` — a TOCTOU for the post-chmod verification**
-`capture_screenshot.py:98–101`
-After `path.chmod(0o700)`, the code reads `path.stat().st_mode` to verify the
-permissions were applied.  Between the `chmod` and the `stat`, another process could
-change the permissions again.  The verification would then pass on stale data.  The
-practical risk is low (requires a local attacker with write access to the parent
-directory), but the pattern is logically broken as a security check.
-_Suggested fix:_ Use an `os.open`-based approach with `O_PATH` and `fchmod`/`fstat`
-on the same file descriptor, eliminating the race.
+**[low] Windows `EnumWindows`/`GetWindowText` require no OS-level permission gate**
+`capture_screenshot.ps1:177–193` (`Find-WindowHandles`)
+On Windows, `EnumWindows` + `GetWindowText` enumerate all visible window titles
+without any OS consent prompt, special privilege, or permission toggle. This is
+distinct from the macOS model (noted as info on 2026-06-08), where
+`CGWindowListCopyWindowInfo` requires the Screen Recording permission. On Windows a
+shared-machine co-tenant could in principle observe that the skill is running a window
+title scan (e.g., via process handle or ETW), and the absence of an OS-level gate
+means there is no user-facing notice prior to the enumeration. The titles are never
+printed and are used only for query matching, so there is no direct data leak; the
+concern is the lack of an equivalent OS-enforced consent step.
+_Suggested fix:_ No code change is possible at the application layer (EnumWindows
+requires no privilege). Document in SKILL.md that Windows window title enumeration has
+no OS gate, so the skill's own consent check (`-ConsentConfirmed`) is the only guard
+on Windows.
 
 ---
 
 ### Bugs & regressions
 
-**[medium] `resolve_macos_with_helper` does not propagate `subprocess.CalledProcessError` from the clang compilation step**
-`capture_screenshot.py:resolve_macos_with_helper`
-`subprocess.run([clang, …], check=True)` will raise `CalledProcessError` if
-compilation fails (e.g., missing Xcode CLT, corrupted source file).  This exception is
-not caught; it propagates through `main` as an unhandled exception, producing a Python
-traceback rather than a clean `die()` message.  (Note: a separate entry in 2026-06-11
-and today's review revisits this with additional detail.)
+**[medium] Uncaught `CalledProcessError` if `clang` compilation of the macOS helper fails**
+`capture_screenshot.py:resolve_macos_with_helper` (~line 335)
+```python
+subprocess.run([clang, "-framework", "ApplicationServices", str(helper_source), "-o", str(helper)], check=True)
+```
+If `clang` is available on `$PATH` (so the `shutil.which` check passes) but compilation
+fails — for example because Xcode Command Line Tools are installed but the
+ApplicationServices framework header is missing, or because the SDK path is wrong —
+`subprocess.run(..., check=True)` raises `subprocess.CalledProcessError`. This
+exception is not caught anywhere in `resolve_macos_with_helper` or `main()`, so the
+process exits with an unhandled traceback rather than a structured
+`ResolutionResult(False, …)` and a clean error message.
+_Suggested fix:_ Wrap the clang invocation in a `try/except subprocess.CalledProcessError`
+and return `ResolutionResult(False, "helper_compile_failed", "Could not compile macOS
+window helper — check that Xcode Command Line Tools are fully installed.")`.
 
-**[low] `plan_capture` returns `CapturePlan(False, "no_active_window", …)` for `target == "active"` with empty `window_ids` on Darwin, but `main` never calls `plan_capture` without first resolving the active window**
-`capture_screenshot.py:plan_capture` (Darwin active branch)
-The guard `if not window_ids: return CapturePlan(False, "no_active_window", …)` is
-unreachable on Darwin when `target == "active"`, because `main` resolves the active
-window ID via `resolve_macos_with_helper` before calling `plan_capture`, and dies on
-failure.  Dead code.  Not a bug, but adds cognitive overhead.
+**[low] PS dry-run mode can return duplicate paths when multiple windows share a label**
+`capture_screenshot.ps1:104–119` (`New-CapturePath`)
+`New-CapturePath` determines uniqueness by checking `Test-Path` on the filesystem.
+In `--dry-run --allow-multiple-matches` mode, no files are written to disk, so every
+call for the same label returns the same candidate path (e.g., `chrome.png`). If two
+windows match the same query, `Capture-ToDestination` prints the same path twice. The
+Python version avoids this with an in-memory `reserved` set passed between calls.
+_Suggested fix:_ Introduce a script-level `$script:ReservedPaths` hash set (e.g.,
+`[System.Collections.Generic.HashSet[string]]::new()`) and consult it in
+`New-CapturePath` alongside `Test-Path`, mirroring `unique_capture_path`'s `reserved`
+parameter.
+
+**[low] PS `throw` statements exit with code 1 rather than structured exit codes**
+`capture_screenshot.ps1` (multiple `throw` sites)
+Several error conditions — missing query for window target, no matching window found,
+multiple matching windows, and PowerShell internal errors — are raised with `throw`,
+which causes the script to exit with code 1. Only the two `exit 75`
+(`window_not_capturable`) and `exit 0` paths use structured codes. The Python
+orchestrator's callers may check the exit code for routing (e.g., distinguishing
+`EXIT_USAGE=64` from `EXIT_UNAVAILABLE=74`); any error that falls through `throw`
+returns 1 instead, inconsistent with the documented code table.
+_Suggested fix:_ Replace `throw` with `[Console]::Error.WriteLine(…); exit <code>`
+for each structured error case, matching the exit codes defined in the Python script
+(`EXIT_USAGE=64`, `EXIT_UNAVAILABLE=74`).
 
 ---
 
 ### Data leaks
 
-No new findings.  The `_escape_ere` function confirmed not to expose the query value
-in error messages.  Window titles remain unexposed across all code paths reviewed.
+No new findings. Window titles continue to be confined to in-process memory on all
+platforms. The PS `Test-BitmapAllBlack` warning message includes `$Label` (the
+user-supplied query text, not a window title), which is acceptable. The `throw`
+messages include the user's query text (e.g., the needle in `Find-WindowHandles`) but
+never window titles retrieved via `GetWindowText`.
 
 ---
 
 ### UX
 
-**[info] `--query` values are silently ignored when `--target` is `fullscreen` or `active`**
-`capture_screenshot.py:main`
-If a user passes `--target fullscreen --query "Chrome"`, the query is accepted by
-`argparse` but ignored without warning.  A user who mistakenly specifies a query with
-a non-window target receives no feedback.
-_Suggested fix:_ Validate that `args.query` is empty when `args.target != "window"`,
-and call `die("--query is only valid with --target window", EXIT_USAGE)`.
+**[low] macOS helper binary is recompiled with `clang` on every named-window request**
+`capture_screenshot.py:resolve_macos_with_helper` (~line 325–342)
+`find_macos_window_id` is compiled from source into a fresh `TemporaryDirectory` on
+each invocation of `--target window` or `--target active` on macOS. `clang`
+compilation adds roughly 0.5–1 s of latency to every such request. The compiled binary
+is discarded when the context manager exits and rebuilt the next time.
+_Suggested fix:_ Cache the compiled binary alongside the source (e.g., in
+`skill_dir/scripts/.cache/find_macos_window_id`) keyed on the source's `mtime` or
+hash, and only recompile when the source changes. Fall back to recompile if the cache
+is stale or missing.
+
+**[info] `Test-BitmapAllBlack` sparse-grid sampling may miss narrow non-black content**
+`capture_screenshot.ps1:Test-BitmapAllBlack` (~line 220–237)
+The GPU/Electron black-capture warning samples one pixel every `width/16` columns and
+`height/16` rows. On a 1920×1080 window, columns are sampled every 120 pixels, meaning
+a 119-pixel-wide stripe of non-black content between two sample columns is invisible to
+the check. The warning is advisory-only and does not block the save, so this is
+cosmetic; the user sees no warning but still receives the (mostly-black) PNG. No fix
+is required, but a note in code comments that the check is a coarse heuristic would
+avoid misreading the function as exhaustive.
 
 ---
 
@@ -312,77 +412,99 @@ and call `die("--query is only valid with --target window", EXIT_USAGE)`.
 
 ### Security
 
-**[medium] `Protect-Directory` in PowerShell creates the directory before setting ACLs, leaving a brief world-accessible window**
-`scripts/capture_screenshot.ps1:Protect-Directory`
-`New-Item -ItemType Directory -Path $Path -Force` creates the directory with inherited
-ACLs (typically SYSTEM + Administrators + current user on a default Windows install).
-`Get-Acl` / `Set-Acl` are called immediately after, but there is a brief TOCTOU window
-where another local process could enumerate the new directory or write into it before
-the owner-only ACL is applied.
-_Suggested fix:_ Use `[System.IO.Directory]::CreateDirectory(path, directorySecurity)`
-with a pre-built `DirectorySecurity` object to set the ACL atomically at creation time.
-
-**[low] PowerShell `Protect-File` does not verify the ACL was applied successfully**
-`scripts/capture_screenshot.ps1:Protect-File`
-`Set-Acl` is called without checking the return value or catching exceptions specific
-to ACL-write failure (e.g., insufficient privilege on a network path).  If the ACL
-application fails silently, the file retains inherited permissions.  `Set-Acl` in
-PowerShell does throw on failure in `Stop` error mode (which is set globally), so in
-practice this is caught — but the error message would be a raw PowerShell exception
-rather than a structured `die`-style message.
-
-**[low] Windows `New-TemporaryCapturePath` uses PID + index for uniqueness — predictable within same user session**
-`scripts/capture_screenshot.ps1:New-TemporaryCapturePath`
-The temp filename is `.{stem}.{PID}.{index:D3}.tmp.png`.  Within the same user
-session, a racing process that knows the PID could predict the temp path.  The
-`FileMode::CreateNew` + `FileShare::None` creation is atomic and immune to a file-pre-
-creation race (the iterator skips taken names), but the predictability is a latent
-concern if the directory ever becomes world-writable.
-_Suggested fix:_ Add `[System.IO.Path]::GetRandomFileName()` to the temp name.
+**[low] `_test_windows()` does not catch `json.JSONDecodeError` on malformed input**
+`capture_screenshot.py:308`
+```python
+parsed = json.loads(raw)
+```
+If `CAPTURE_SCREENSHOT_TEST_WINDOWS` contains malformed JSON, `json.loads` raises
+`json.JSONDecodeError`, which propagates as an unhandled exception with a raw Python
+traceback rather than a clean `die()` message. This variable is only active in test/debug
+scenarios, so production risk is minimal, but the failure mode is inconsistent with
+every other validation path in the module.
+_Suggested fix:_ Wrap in `try/except json.JSONDecodeError` and call
+`die("CAPTURE_SCREENSHOT_TEST_WINDOWS is not valid JSON: ...", EXIT_USAGE)`.
 
 ---
 
 ### Bugs & regressions
 
-**[medium] `Copy-Rectangle` (PowerShell fullscreen/active) captures the screen buffer at the moment of the call, not the window's own pixels**
-`scripts/capture_screenshot.ps1:Copy-Rectangle`
-`Graphics.CopyFromScreen` copies whatever pixels are currently rendered at the given
-screen coordinates.  If another window moves over the target between when the bounds
-are obtained (`Get-WindowBounds`) and when `CopyFromScreen` runs, the captured image
-contains the occluding window.  This is inherent to the `CopyFromScreen` API.  The
-per-window `Copy-Window` path (using `PrintWindow`) correctly avoids this for named-
-window and active-window targets; the fullscreen path (`Copy-Rectangle`) cannot avoid
-it by nature.
+**[high] Linux X11 named-window clipboard capture always crashes with "internal error: missing output path"**
+`capture_screenshot.py:288–296` (`plan_capture`) and `capture_screenshot.py:499–502` (`execute_plan`)
+When `--target window --destination clipboard` is used on Linux X11 with `xdotool` and
+`import` available, `plan_capture` returns commands containing `"{output}"` placeholders
+for every window ID:
+```python
+commands = tuple((import_cmd, "-window", str(window_id), "{output}") for window_id in window_ids)
+```
+The `"{output}"` placeholder signals a desktop-bound path. In `execute_plan`, the
+clipboard branch at line 499 calls `run_command(command)` without an `output` argument.
+`run_command` immediately dies with "internal error: missing output path" (exit 64) when
+it encounters `"{output}"` in the command with `output=None`. The Wayland path is
+correctly rejected earlier (`unsupported_wayland_window_capture`), but the X11 path is
+not guarded. The user receives an opaque internal error rather than a working capture or
+a clean "not supported" message.
+_Suggested fix:_ Either (a) return a `CapturePlan(False, "unsupported_linux_x11_window_clipboard", …)`
+for this combination explicitly in `plan_capture`, or (b) use `"{temp-output}"` and pipe
+to `xclip`/`xsel` by adding those to the plan (mirroring the grim+wl-copy path), plus a
+`copy_file_to_clipboard` call in `execute_plan`.
 
-**[low] `Test-BitmapAllBlack` returns `$true` for zero-dimension bitmaps**
-`scripts/capture_screenshot.ps1:Test-BitmapAllBlack`
-The early-return guard `if ($Bitmap.Width -le 0 -or $Bitmap.Height -le 0) { return $true }`
-causes a zero-size bitmap to be flagged as all-black, which then emits a warning.
-A zero-dimension bitmap cannot arise from `Copy-Window` (which throws on zero bounds
-via `Get-WindowBounds`), but the guard is overly conservative.
+**[medium] `xsel` clipboard backend sets no MIME type on clipboard content**
+`capture_screenshot.py:475–476`
+```python
+elif name == "xsel":
+    subprocess.run([tool, "--clipboard", "--input"], input=data, check=True)
+```
+When `xsel` is the clipboard tool (the fallback when `xclip` is absent),
+`copy_file_to_clipboard` writes raw PNG bytes to the clipboard without specifying a MIME
+type. `xclip` uses `-t image/png` and `wl-copy` uses `--type image/png`; `xsel` has no
+equivalent flag. Most graphical applications (browsers, office suites, image editors)
+look for a typed `image/png` selection target and will fail to paste or will paste as
+raw binary. The capture appears to succeed (exit 0, "clipboard" printed) but the result
+is not usable.
+_Suggested fix:_ Prefer `xclip` over `xsel` in `plan_capture` (already done:
+`clip = xclip or xsel`), and add a warning when `xsel` is selected that paste
+compatibility may be limited. Long-term, replace `xsel` in the clipboard path with a
+`xclip`-only requirement or with `wl-copy` on Wayland.
+
+**[low] `install.sh` does not guard against an unset or empty `$HOME`**
+`install.sh:36,41,47`
+All three agent skill paths are constructed as `"$HOME/.claude/skills"`, `"$HOME/.codex/skills"`,
+and `"$HOME/.config/opencode/skills"`. If `$HOME` is unset (unusual but possible in
+restricted or CI environments), these expand to `"/.claude/skills"`, `"/.codex/skills"`,
+and `"/.config/opencode/skills"`. A stray `[ -d "/.claude/skills" ]` that returns
+true (e.g., on a container image that pre-populates that path) would cause
+`clone_if_missing` to attempt `git clone "$REPO" "/.claude/skills/capture-screenshot"`,
+writing into a system-owned directory and likely failing with a permission error or,
+worse, succeeding if run as root.
+_Suggested fix:_ Add `[ -z "$HOME" ] && { echo "error: \$HOME is not set"; exit 1; }` near
+the top of the script, before the first path check.
 
 ---
 
 ### Data leaks
 
-**[info] `Test-BitmapAllBlack` warning message includes the user's query label**
-`scripts/capture_screenshot.ps1:Capture-ToDestination`
-The warning `"warning: '$Label' rendered black via PrintWindow …"` includes `$Label`,
-which is the sanitised form of the user's query (not the actual window title).  The
-user's query is not sensitive in itself, but it confirms which application was targeted.
-This is by design (matching the Python layer's convention of echoing query text, not
-titles), and the label is already printed as part of the output path; recorded as
-info-level for completeness.
+No new findings. Window title isolation continues to hold across all platforms:
+- Linux X11 crash path (above) emits only the static string "internal error: missing
+  output path" — no window title is exposed in the error.
+- `xsel` clipboard bug writes raw PNG bytes, not metadata derived from window titles.
+- All error messages in `find_macos_window_id.m` continue to emit only static strings or
+  the `unknown`/`minimized` reason token with no title content.
 
 ---
 
 ### UX
 
-**[info] `spectacle -b -n` (KDE) may open a transient notification even in background mode**
-`capture_screenshot.py:plan_capture` (Linux desktop path, spectacle branch)
-`spectacle -b -n` is intended to capture without GUI, but on some KDE versions it
-still emits a D-Bus notification.  This can be surprising to users expecting a silent
-capture.
+**[medium] Linux X11 named-window clipboard capture surfaces an opaque internal error**
+`capture_screenshot.py:499–502`
+(Same root cause as the high-severity bug above.) A user running
+`capture_screenshot.py --target window --destination clipboard --query Firefox` on Linux
+X11 receives exit code 64 and the message "internal error: missing output path" — which
+gives no hint that clipboard capture of named windows is unsupported on this platform.
+The macOS and Wayland paths return structured, actionable codes; X11 clipboard/window
+should do the same.
+_Suggested fix:_ Same as the bug entry above — return a structured `CapturePlan(False, …)`
+rather than letting the internal placeholder mismatch surface to the user.
 
 ---
 
@@ -390,88 +512,136 @@ capture.
 
 ### Security
 
-**[medium] `_validate_output_root` resolves `path` before checking containment, but `output_root` itself is not resolved before `ensure_private_directory` is called**
-`capture_screenshot.py:_validate_output_root` and `prepare_output_paths`
-`_validate_output_root` calls `path.resolve().relative_to(home)`.  If `output_root`
-contains a `..` component that resolve would normalise away (e.g.,
-`~/Desktop/../../../etc/screenshots`), `resolve()` canonicalises it correctly and the
-check works.  However, `prepare_output_paths` passes the *unresolved* `output_root`
-to `ensure_private_directory`, which calls `path.mkdir(parents=True)`.  If an
-intermediate component of the path is a symlink added after the `_validate_output_root`
-check, `mkdir` would follow it, potentially creating the directory outside the home.
-The `is_symlink()` check in `ensure_private_directory` only guards the *leaf*
-directory; it does not traverse and verify intermediate components.
-_Suggested fix:_ After `_validate_output_root` passes, resolve the path and use the
-canonical form for all subsequent directory operations.
+**[medium] Empty `--query ""` matches every visible window on all three platforms**
+`capture_screenshot.py:580–594`, `capture_screenshot.ps1:384–401`, `find_macos_window_id.m:107`
+`parse_args` and the per-platform window resolution functions accept an empty string as a
+valid query value. The `--target window` guard at line 580 only checks `if not args.query`
+(list is non-empty); it does not reject elements that are empty strings. On Linux, xdotool
+`search --name ""` matches all windows with a non-empty title. On macOS, `CFStringFind`
+with an empty-string needle always returns a match (`range.location != kCFNotFound`), so
+the C helper classifies every normal-layer window as a hit. On Windows,
+`String.IndexOf("", OrdinalIgnoreCase)` returns 0 (≥ 0 = match), causing
+`Find-WindowHandles` to collect every visible window. With `--allow-multiple-matches`, all
+visible windows are captured, silently breaking the privacy guarantee that the capture scope
+is never wider than the user's named target. Without that flag the result is either a
+"multiple matches" error (harmless) or, on a single-window desktop, capture of the one
+remaining window (not the intended target).
+_Suggested fix:_ Add a validation step — in `parse_args` or at the start of the window
+resolution functions — that rejects any empty-string query element with `die("--query must
+not be empty", EXIT_USAGE)`. Add a corresponding test.
 
-**[low] `_run_powershell_script` does not validate `ps_script` is within `skill_dir`**
-`capture_screenshot.py:_run_powershell_script`
-`ps_script = skill_dir / "scripts" / "capture_screenshot.ps1"` is constructed by
-joining trusted constants, so the path is controlled.  However, there is no assertion
-that `ps_script.resolve()` is beneath `skill_dir.resolve()`.  If `skill_dir` itself
-were a symlink pointing outside the intended directory (e.g., due to a malicious
-install), the check would not catch it.  Low severity given that `skill_dir` is derived
-from `Path(__file__).resolve().parents[1]` (already resolved).
+**[medium] `agents/openai.yaml` sets `allow_implicit_invocation: true`**
+`agents/openai.yaml:7`
+The OpenAI agent YAML policy enables implicit invocation, meaning the capture-screenshot
+skill can be selected by the model without an explicit user request. In an agentic pipeline
+where the model independently decides to capture a screenshot, the consent gate provided by
+`--consent-confirmed` / `-ConsentConfirmed` could be satisfied programmatically without a
+visible user approval step. This partially undermines the consent enforcement described in
+SKILL.md ("Before any capture, ask the user to approve the exact scope"). The SKILL.md
+instructions apply to a human-in-the-loop workflow; `allow_implicit_invocation` relaxes
+that assumption.
+_Suggested fix:_ Either set `allow_implicit_invocation: false` to require explicit user
+invocation, or document in SKILL.md and the YAML file why implicit invocation is safe (e.g.,
+if the model is still required to prompt for `--consent-confirmed` before executing the
+command).
+
+**[low] TOCTOU between `output.exists()` check and `os.replace()` in `execute_plan`**
+`capture_screenshot.py:512–514`
+```python
+if output.exists() or output.is_symlink():
+    die("refusing to overwrite an existing screenshot path", EXIT_PRIVACY)
+os.replace(temp_output, output)
+```
+Between the existence check and the `os.replace` call, a local attacker or concurrent
+process could create a symbolic link at `output`. `os.replace()` on Linux atomically
+replaces the target of a symlink (i.e., it follows the link and overwrites the pointed-to
+file) rather than replacing the symlink itself. This could cause the screenshot to be
+written to an attacker-controlled path. Note: this is distinct from the 2026-06-08 finding,
+which covers the TOCTOU in `ensure_private_directory` between `is_symlink()` and `mkdir`.
+_Suggested fix:_ On Linux, use `os.open` with `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW`
+to create the final file atomically without following symlinks, then write temp content
+into it; or verify post-replace that `output` is not a symlink.
 
 ---
 
 ### Bugs & regressions
 
-**[medium] `allow_multiple=True` with multiple queries returns IDs from all queries interleaved, but `labels` and `window_ids` lists stay in sync only if each query resolves to the same number of IDs**
-`capture_screenshot.py:main` (window target, multiple `--query` values)
-`window_ids.extend(resolution.ids)` and `labels.extend([sanitize_label(query)] * len(resolution.ids))`
-keep the two lists parallel, so `prepare_output_paths` and `plan_capture` receive
-matching sequences.  This is correct.  However, `plan_capture` receives only
-`label=labels[0]` (the first label) — the per-window labels are not available inside
-`plan_capture`.  The `label` parameter is used only in error messages inside
-`plan_capture`; the actual per-window output paths are determined by `prepare_output_paths`
-outside it.  Not a bug today, but the mismatch in information flow is a maintenance
-hazard.
+**[medium] Windows DPI scaling causes incorrect capture bounds for active and named-window targets**
+`capture_screenshot.ps1:226–234` (`Get-WindowBounds`), `capture_screenshot.ps1:239–246` (`Copy-Rectangle`)
+`GetWindowRect` returns window coordinates in logical (DPI-unscaled) pixels. In .NET's
+GDI+ layer, `Graphics.CopyFromScreen` operates in device (physical) pixels as reported by
+the DC. On displays with display scaling (e.g., 150% or 200% DPI), logical and physical
+coordinate spaces diverge: a window whose logical rect is (0, 0, 960, 540) occupies
+(0, 0, 1440, 810) in physical pixels. `Copy-Rectangle` constructs a `Drawing.Bitmap` with
+the logical dimensions and blits the physical-pixel region, resulting in a capture that is
+undersized (missing the right/bottom portion of the window) or misaligned. `PrintWindow`
+(used in `Copy-Window`) is unaffected because it renders into the DC at the window's own
+resolution. The issue affects `--target active` and `--target fullscreen` on scaled
+displays.
+_Suggested fix:_ Retrieve the DPI scale factor (via `Graphics.DpiX / 96.0`) and multiply
+the logical rect dimensions before allocating the bitmap and calling `CopyFromScreen`, or
+set the PowerShell process to be Per-Monitor DPI aware via a manifest / `SetProcessDpiAwareness`.
 
-**[low] On Linux with Wayland and no supported tool, `plan_capture` returns `missing_dependency_fullscreen` for `target=fullscreen/clipboard` even when grim is present but `wl-copy` is absent**
-`capture_screenshot.py:plan_capture` (Linux clipboard fullscreen, `grim` present but `wl-copy` absent)
-`if grim and wl_copy: …` is the first clipboard branch checked.  If `grim` is present
-but `wl-copy` is absent, the branch is skipped and the function falls through to
-`import_cmd and (xclip or xsel)`.  If `import` is also absent, the error message is
-`"missing_dependency_fullscreen"` rather than a more specific
-`"missing_dependency_wl_copy"`.  The user is told a generic "no tool found" message
-when in fact the specific missing piece is `wl-copy`.
-_Suggested fix:_ Check for `grim` alone first; if `grim` is present but `wl-copy` is
-absent, return a targeted `missing_dependency_wl_copy` error.
+**[low] `Copy-Rectangle` fails or produces a wrapped capture when a window has negative screen coordinates**
+`capture_screenshot.ps1:239–246` (`Copy-Rectangle`)
+On multi-monitor systems where the primary monitor is not the leftmost display, windows
+positioned on monitors to the left of the primary have negative `.Left` or `.Top`
+coordinates in `GetWindowRect`. `Graphics.CopyFromScreen` with negative source coordinates
+is undefined in some .NET implementations and may throw, silently wrap the coordinates to
+zero, or produce an incorrectly offset capture. This affects `--target active` and named
+`--target window` captures on such configurations.
+_Suggested fix:_ Guard against negative bounds by clamping to the virtual screen rectangle
+(`[Windows.Forms.SystemInformation]::VirtualScreen`) or by catching exceptions from
+`CopyFromScreen` and reporting `window_not_capturable` with a descriptive message about
+the off-screen position.
 
-**[low] `unique_capture_path` iterates up to index 999 before dying — the die message does not name the conflicting label**
-`capture_screenshot.py:unique_capture_path`
-The die message is a generic `"could not allocate a unique screenshot filename"`.
-Adding the label and folder path to the message would help diagnose a runaway
-duplicate-label scenario.
+**[low] PowerShell temp file uses a dot-prefix (hidden attribute), inconsistent with Python's documented avoidance**
+`capture_screenshot.ps1:163` vs `capture_screenshot.py:437–439`
+`New-TemporaryCapturePath` names the temp file `.{stem}.{PID}.{index}.tmp.png`
+(dot-prefix). The Python path explicitly avoids dot-prefixes because macOS `screencapture`
+refuses to write to hidden files, and includes a comment explaining this. While Windows has
+no such restriction, some endpoint-security and backup agents skip hidden files (files with
+the dot-prefix or the Hidden attribute). A screenshot capture that fails between writing the
+temp file and the `Move-Item` would leave a hidden residual file not visible in Explorer.
+The `finally` cleanup block does handle this case, so data exposure risk is low, but the
+inconsistency between platforms is a latent maintenance hazard.
+_Suggested fix:_ Name the temp file without a leading dot, e.g.,
+`'{0}.{1}.{2:D3}.tmp.png' -f $stem, $PID, $i`, consistent with the Python version.
 
 ---
 
 ### Data leaks
 
-**[info] `sanitize_label` strips `https?://` but not other URI schemes (e.g., `file://`, `ssh://`)**
-`capture_screenshot.py:sanitize_label`
-`re.sub(r"https?://", "", label)` removes `http://` and `https://` prefixes, but
-`file:///home/user/secrets` would become `file:homeusersecretes` (the slashes are
-converted to hyphens by the subsequent `[^a-z0-9]+` pass).  The `file:` prefix is not
-stripped.  In practice, window titles rarely begin with `file://` URIs, but the
-sanitisation is not URI-generic.
+No new findings. The empty-query bug (Security above) would result in captures of
+unintended windows, but the output path and filenames are still derived from the
+sanitized query (empty → "capture") rather than actual window titles. The DPI and
+negative-coordinate issues involve pixel data, not metadata. The `allow_implicit_invocation`
+concern is about consent process, not title leakage. All previously documented title-privacy
+invariants continue to hold in the reviewed code.
 
 ---
 
 ### UX
 
-**[medium] `--query` silently discarded with `--target fullscreen` or `--target active`**
-`capture_screenshot.py:main`
-As noted in the 2026-06-09 entry, `--query` values are silently ignored for non-window
-targets.  The fix has not been applied as of this review; carry-forward tracking note.
+**[low] No test coverage for empty `--query ""` validation**
+`tests/test_capture_screenshot.py`
+The test suite has no test that passes `--query ""` (or `--query` with an empty string)
+and asserts an early exit with `EXIT_USAGE`. Given that the empty-query issue silently
+expands capture scope (see Security above), a targeted regression test is warranted.
+_Suggested fix:_ Add a test that calls `parse_args` or runs the script subprocess with
+`--target window --query ""` and asserts `EXIT_USAGE` (exit code 64) and a message
+containing "must not be empty".
 
-**[info] Install script (`install.sh`) does not verify a skills directory exists before offering installation**
-`install.sh`
-The script checks for `~/.claude/skills`, `~/.codex/skills`, and
-`~/.config/opencode/skills`.  If none exist, it prints a manual-install message.  It
-does not check whether the agent binaries themselves are installed, so a user with a
-skills directory for a different agent might see an unexpected "already installed" message.
+**[info] `allow_implicit_invocation: true` in `agents/openai.yaml` is not mentioned in SKILL.md**
+`agents/openai.yaml:7`, `SKILL.md`
+SKILL.md's "Required Workflow" section instructs the agent to ask the user for approval
+before each capture. The `allow_implicit_invocation: true` policy in the OpenAI YAML
+could allow the skill to be selected without the user explicitly typing a capture request,
+which is not discussed in SKILL.md. A user unfamiliar with this YAML knob might assume
+explicit invocation is always required.
+_Suggested fix:_ Add a note to SKILL.md (or to the YAML file itself) explaining the
+implicit-invocation policy and confirming that the consent guard still applies even when
+the skill is invoked implicitly.
 
 ---
 
@@ -479,69 +649,100 @@ skills directory for a different agent might see an unexpected "already installe
 
 ### Security
 
-**[medium] `_validate_output_root` does not guard `--dry-run` invocations in the original implementation**
-`capture_screenshot.py:main`
-Corrected in the current codebase: `_validate_output_root` is now called
-unconditionally (before the `--dry-run` short-circuit), so the home-containment check
-applies even when no files are written. Status: **already fixed**.  Recorded for
-completeness.
+**[low] PowerShell `$matches` variable name collides with the automatic regex variable**
+`capture_screenshot.ps1:204`
+`Find-WindowHandles` assigns `$matches = [System.Collections.Generic.List[IntPtr]]::new()`,
+shadowing PowerShell's built-in automatic variable `$Matches` (populated after `-match` and
+`Select-String` operations). No regex operations currently occur in this function, so there
+is no runtime bug, but PSScriptAnalyzer raises `PSAvoidAssignmentToAutomaticVariable` for this
+assignment. A future maintainer who adds a `-match` expression inside `Find-WindowHandles`
+would find `$matches` already holding the `List[IntPtr]` instead of the regex capture groups,
+producing a hard-to-diagnose failure.
+_Suggested fix:_ Rename `$matches` to `$matchedHandles` (or similar) throughout
+`Find-WindowHandles`.
 
-**[low] `install.sh` clones over plain HTTPS without signature or checksum verification**
-`install.sh:clone_if_missing`
-`git clone "$REPO" "$dest"` fetches over HTTPS.  There is no GPG signature check on
-the cloned content.  A compromised GitHub repository or a MITM that breaks TLS
-(e.g., via a corporate proxy with custom CA) could deliver malicious scripts.  This is
-inherent to the `git clone` install pattern; noted as an architectural limitation
-rather than an implementation bug.
-
-**[info] `CAPTURE_SCREENSHOT_TEST_PLATFORM` env var can redirect execution to the Windows PowerShell path on non-Windows hosts**
-`capture_screenshot.py:main`, `_test_platform`
-Setting `CAPTURE_SCREENSHOT_TEST_PLATFORM=Windows` on a Linux/macOS host causes
-`_run_powershell_script` to be called.  If `powershell.exe` or `pwsh` happens to be
-installed (e.g., PowerShell Core on Linux), it will attempt to run the PS1 script.
-This is an intentional test hook, but an undocumented one; a misconfigured environment
-could trigger unexpected behaviour in production.
-_Suggested fix:_ Guard test hooks behind an explicit `CAPTURE_SCREENSHOT_UNSAFE_TEST_MODE=1`
-variable or remove them from non-test builds.
+**[low] `install.sh` does not verify `git` is available before invoking `git clone`**
+`install.sh:27`
+`clone_if_missing` calls `git clone` without first checking that `git` exists in `PATH`. On a
+system where git is absent, execution fails with `git: command not found` after the installer
+has already printed the banner and detected agent directories, producing a confusing mid-run
+failure with no clear remediation message. In a container image where `/.claude/skills` happens
+to exist (e.g., a pre-built image) and the process runs as root, a missing git binary that is
+later installed by a setup hook could introduce a window where the check passes but git is
+absent.
+_Suggested fix:_ Add `command -v git >/dev/null 2>&1 || { echo "error: git is required but not
+found in PATH"; exit 1; }` near the top of the script, before the first agent-detection block.
 
 ---
 
 ### Bugs & regressions
 
-**[medium] `resolve_linux_named_window` returns all IDs unfiltered when neither `xprop` nor `xwininfo` is available**
-`capture_screenshot.py:resolve_linux_named_window`
-When neither `xprop` nor `xwininfo` is in `tools`, `_linux_window_is_viewable` returns
-`None` for every window, and the code keeps all IDs.  This means a minimised window
-could be passed to `import -window {id}`, which may produce a black or empty image
-without error.  The fallback behaviour degrades silently.
-_Suggested fix:_ Emit an `info`-level warning to stderr when classification tools are
-absent, so the user knows capture may include non-viewable windows.
+**[low] `execute_plan` clipboard `{temp-output}` dispatch is silently broken for any plan that uses `{temp-output}` in a non-two-command sequence**
+`capture_screenshot.py:491`
+The branch that routes clipboard captures through a temp file checks:
+```python
+if destination == "clipboard" and len(plan.commands) == 2 and "{temp-output}" in plan.commands[0]:
+```
+The `len(plan.commands) == 2` guard is an undocumented implicit contract between `plan_capture`
+and `execute_plan`. If a future `plan_capture` path adds a single-command or three-command plan
+containing `{temp-output}`, the condition is False and execution falls through to the standard
+clipboard branch (line 499), which calls `run_command(command)` without a `temp_output` argument.
+`run_command` then immediately dies with "internal error: missing temporary output path" (exit 64).
+The failure is silent at plan construction time and only surfaces at runtime. This is structurally
+related to the 2026-06-11 finding about dead args beyond `commands[1][0]` in clipboard plans; both
+stem from the implicit two-command contract.
+_Suggested fix:_ Replace the `len == 2` guard with `any("{temp-output}" in cmd for cmd in
+plan.commands)` so the dispatch is robust to command count. Add a comment documenting the
+two-step `capture → copy-to-clipboard` structure and why `commands[1][0]` is the only element
+consumed from the second command.
 
-**[low] `resolve_linux_named_window` does not limit the number of windows returned by `xdotool search`**
-`capture_screenshot.py:resolve_linux_named_window`
-`xdotool search` can return hundreds of window IDs for a broad query.  Without
-`allow_multiple`, the multiple-match guard fires correctly.  With `allow_multiple`,
-all IDs are accepted, potentially generating hundreds of screenshot files.  No
-practical bound is enforced.
+**[info] `plan_capture` re-reads `XDG_SESSION_TYPE` from the environment when `session_type` is the empty string**
+`capture_screenshot.py:234`
+```python
+session = (session_type or os.environ.get("XDG_SESSION_TYPE") or "").lower()
+```
+`main()` passes `os.environ.get("XDG_SESSION_TYPE")` (line 631), which returns `None` when the
+variable is absent (not `""`), so the double-read is harmless in the common case. However, if
+`XDG_SESSION_TYPE` is exported as an empty string in the environment, `main()` passes `""` to
+`plan_capture`, which evaluates as falsy and falls through to `os.environ.get` again — reading
+the same empty string. The API creates a subtle ambiguity: callers cannot explicitly pass "no
+session type override" because `""` is indistinguishable from `None` as a signal to fall back to
+the environment.
+_Suggested fix:_ Use `session_type if session_type is not None else os.environ.get("XDG_SESSION_TYPE", "")`
+in `plan_capture`, treating `None` as "read from environment" and `""` as an explicit "unset" override.
 
 ---
 
 ### Data leaks
 
-No new findings.  All error and output paths reviewed continue to use sanitised labels
-(never raw window titles).
+No new findings. Window title isolation continues to hold across all reviewed code paths. The
+`$matches` naming issue involves window handle integers (IntPtr), not titles. The `install.sh`
+git-availability failure exposes no user data. All error messages in all three platform paths
+continue to echo only the user-supplied query text, never real window titles retrieved from the OS.
 
 ---
 
 ### UX
 
-**[low] `not_capturable_message` passes state `"unknown"` when the macOS C helper cannot distinguish minimised from off-Space**
-`capture_screenshot.py:not_capturable_message`
-The macOS helper emits `"unknown"` as the reason token when it cannot determine whether
-a window is minimised or on another Space.  The user-facing message falls through to
-the generic branch: "'{query}' exists but cannot be captured (minimized or off-screen)
-— restore it and retry."  This is acceptable but could be improved if the helper
-distinguished the two states.
+**[low] Windows: `PrintWindow` black-image detection warns but does not fall back to `CopyFromScreen`**
+`capture_screenshot.ps1:306–314`
+When `Test-BitmapAllBlack` detects that `PrintWindow` returned an all-black bitmap (the known
+failure mode for GPU/DirectX/Electron windows such as Chrome), `Capture-ToDestination` writes the
+warning to stderr but still saves and returns the black PNG. Since the user explicitly named (or
+brought forward) the target window, it is typically unoccluded and suitable for a screen-buffer
+blit via `CopyFromScreen`. An automatic silent fallback to `Copy-Rectangle` would deliver a
+usable screenshot instead of a guaranteed-useless black image. The current behaviour forces the
+user to bring the window forward, try again, and is not documented in the error message.
+_Suggested fix:_ After detecting an all-black `PrintWindow` result, retry via `Copy-Rectangle`
+and use that bitmap instead. Log a single debug-level warning (e.g., to stderr if `-Verbose` is
+active) that a CopyFromScreen fallback was used.
+
+**[low] `install.sh` provides no early-exit message when `git` is unavailable**
+`install.sh:27`
+(Same root cause as the Security finding above.) On a git-free system the user sees the installer
+banner, agent detection output, and then an OS error for each `clone_if_missing` invocation,
+rather than a single actionable "git is required" message before any output.
+_Suggested fix:_ Same as the Security entry above.
 
 ---
 
@@ -549,62 +750,60 @@ distinguished the two states.
 
 ### Security
 
-**[low] `run_command` silently drops extra `{output}` placeholders if a command tuple contains more than one**
-`capture_screenshot.py:run_command`
-`run_command` substitutes `{output}` and `{temp-output}` wherever they appear in the
-command tuple.  If a command were constructed (by a future change to `plan_capture`)
-with two `{output}` placeholders, both would be replaced with the same path, creating
-two references to the output file in the same command.  This could cause tools to fail
-or behave unexpectedly.  No current command has duplicate placeholders; this is a
-latent correctness risk.
+**[medium] README documents `curl | bash` as the primary install method, creating a supply-chain trust gap**
+`README.md:15`
+```bash
+curl -fsSL https://raw.githubusercontent.com/nishalpattan/capture-screenshot/main/install.sh | bash
+```
+This pattern downloads and immediately executes the script without giving the user any opportunity to review it. If the GitHub repository or CDN is compromised (account takeover, malicious PR merged, CDN cache poisoning), or if the network path is under active attack (HTTPS mitigates most scenarios but not a compromised CA), arbitrary code runs on the user's machine. Unlike the 2026-06-08 "HTTPS transport for repository integrity" info finding (which covers cloned history), this finding is about the single-command install UX — users typically run it without auditing the script first. The script itself is short and auditable (63 lines, only `git clone`), which limits actual blast radius, but the pattern itself is the concern.
+_Suggested fix:_ Add a two-step form to the README: `curl -fsSL ... > install.sh && cat install.sh` (review) then `bash install.sh` (run). Alternatively, publish a SHA-256 checksum alongside each release and document a `shasum -c` verification step.
 
-**[info] `shutil.which` on macOS may resolve to a Homebrew-installed tool that differs in behaviour from the system tool**
-`capture_screenshot.py:detect_tools`
-On macOS, `shutil.which("screencapture")` resolves to `/usr/sbin/screencapture` in
-typical installs.  If a user has a Homebrew or MacPorts wrapper named `screencapture`
-earlier in `PATH`, the wrapper is used instead.  The wrapper might not support `-l`
-(window ID) or `-x` (no sound) flags, causing silent failures.  Low severity given
-that `screencapture` is not a commonly wrapped tool.
+**[low] macOS helper binary compiled without explicit hardening flags**
+`capture_screenshot.py:339`
+```python
+subprocess.run([clang, "-framework", "ApplicationServices", str(helper_source), "-o", str(helper)], check=True)
+```
+The clang invocation does not pass `-fstack-protector-strong`, `-D_FORTIFY_SOURCE=2`, or an explicit `-Wl,-pie`. On current macOS, clang enables PIE by default for executables and applies reasonable stack protection, so this is not an active vulnerability. However, making the flags explicit ensures the binary is hardened portably across SDK upgrades, alternative toolchains (e.g., `clang` from Homebrew vs. Xcode), and future macOS versions where defaults might change.
+_Suggested fix:_ Extend the compile command to `[clang, "-framework", "ApplicationServices", "-fstack-protector-strong", "-D_FORTIFY_SOURCE=2", str(helper_source), "-o", str(helper)]`.
 
 ---
 
 ### Bugs & regressions
 
-**[medium] `execute_plan` for macOS clipboard with multiple windows calls `run_command` per window, but each run overwrites the clipboard — only the last window's screenshot survives**
-`capture_screenshot.py:execute_plan` (Darwin clipboard, multiple window IDs)
-`for command in plan.commands: run_command(command)` writes each window to the
-clipboard sequentially.  Only the last write persists.  No warning is emitted.  The
-2026-06-08 entry noted this under UX; here it is re-classified as a bug because the
-user explicitly requested `--allow-multiple-matches` with clipboard destination and
-receives silent data loss.
-_Suggested fix:_ If `allow_multiple_matches` and `destination == "clipboard"`, either
-reject the combination with a clear error, or composite the screenshots into a single
-image before writing to the clipboard.
+**[medium] Windows `--allow-multiple-matches --destination clipboard` silently discards all captures except the last**
+`capture_screenshot.ps1:317–319, 396–401`
+The 2026-06-11 entry documented this behavior for the macOS/Python path; the Windows PowerShell script has the same issue independently. When `$AllowMultipleMatches` is set and `$Destination` is `clipboard`, `Capture-ToDestination` is called for each matched window handle in sequence. Each call executes `[Windows.Forms.Clipboard]::SetImage($bitmap)`, which atomically replaces the clipboard contents. For N matched windows, N `"clipboard"` lines are written to stdout, but only the last window's image remains. Users have no indication that earlier captures were discarded.
+_Suggested fix:_ Mirror the macOS suggestion from 2026-06-11: either (a) detect `$AllowMultipleMatches -and $Destination -eq 'clipboard'` and exit early with a structured error — `[Console]::Error.WriteLine("clipboard_allows_one: clipboard destination supports only one window at a time; use desktop for multiple captures"); exit 74` — or (b) emit a stderr warning listing how many captures were requested versus how many survived on the clipboard.
 
-**[low] `prepare_output_paths` with `create=True` creates the request directory before `execute_plan` validates the plan**
-`capture_screenshot.py:main`
-`output_paths = prepare_output_paths(…, create=not args.dry_run)` runs before
-`execute_plan` is called.  If `execute_plan` then fails immediately (e.g., plan is
-not OK), the request directory (e.g.,
-`~/Desktop/screenshots/06_14_2026_15_30_00/`) has already been created and remains
-on disk empty.  Repeated failed captures accumulate empty directories.
+**[low] macOS `--target active` cannot be exercised under the `CAPTURE_SCREENSHOT_TEST_PLATFORM=Darwin` test stub**
+`capture_screenshot.py:325–328`
+`resolve_macos_with_helper` short-circuits to the in-process `resolve_macos_window_ids` function only when `test_windows is not None and not active`. When `--target active` is used, `active=True`, so the condition is `False` and the function falls through to real clang compilation and a real `CGWindowList` query, regardless of `CAPTURE_SCREENSHOT_TEST_WINDOWS` being set. In a Linux CI environment (where clang is absent), this produces `ResolutionResult(False, "missing_dependency_clang", ...)` rather than a controlled test outcome. On macOS CI, it attempts a real window-system query. As a result, the test suite has no coverage for macOS active-window capture and cannot test that code path without a live macOS display session.
+_Suggested fix:_ Extend the test-stub branch: change the condition to `if test_windows is not None:` and, for the `active=True` case, return the first capturable entry from `test_windows` (e.g., the entry with the lowest index that has `capturable` not False). Add a corresponding test `test_macos_active_window_returns_first_capturable` that sets both env variables and asserts a successful resolution.
 
 ---
 
 ### Data leaks
 
-No new findings.
+No new findings. The Windows clipboard last-wins bug (above) involves pixel data only; no window title metadata is written to the clipboard or to any output message. The `"clipboard"` string printed per capture does not encode title information. All previously documented title-privacy invariants continue to hold across all three platform paths.
 
 ---
 
 ### UX
 
-**[info] Empty request directories accumulate on disk after failed captures**
-As noted in Bugs & regressions above: a failed `execute_plan` leaves an empty
-timestamped directory under the screenshots root.  Repeated failures (e.g., missing
-tool, window not found) leave traces on the filesystem without user notification.
-_Suggested fix:_ Create the request directory inside `execute_plan`, after plan
-validation, or delete it on failure.
+**[low] No test case exercises the macOS `--target active` end-to-end flow**
+`tests/test_capture_screenshot.py`
+Consequent on the bug entry above: the test suite covers macOS window-by-name resolution, minimized-window detection, multiple-match handling, and dry-run path output, but has no test for the active-window path (`--target active --destination desktop` or clipboard on Darwin). A regression in `resolve_macos_with_helper` when `active=True` — for example, a change to the `--frontmost` flag handling, the proc.returncode dispatch, or the `_validate_integer_ids` call — would not be caught.
+_Suggested fix:_ Once the test stub is extended (see Bugs & regressions above), add integration tests:
+1. `CAPTURE_SCREENSHOT_TEST_WINDOWS=[{"id":5,"owner":"Terminal","title":"x"}]` + `--target active --dry-run` → asserts `proc.returncode == 0` and printed path contains `active-window`.
+2. `CAPTURE_SCREENSHOT_TEST_WINDOWS=[{"id":5,"owner":"Terminal","title":"x","capturable":false}]` + `--target active` → asserts `proc.returncode == EXIT_NOT_CAPTURABLE`.
+
+**[info] `unique_capture_path` uses `EXIT_PRIVACY` for a resource-exhaustion condition**
+`capture_screenshot.py:99`
+```python
+die("could not allocate a unique screenshot filename", EXIT_PRIVACY)
+```
+`EXIT_PRIVACY = 73` is the documented exit code for privacy-enforcement failures (consent not given, symlink detected, permission lock-down failed). Running out of the 1000-candidate filename namespace is a resource/state problem, not a privacy violation. A caller inspecting exit codes would misclassify this as a privacy refusal. In practice, generating 1000 same-label screenshots in one session is essentially impossible, so this is cosmetic.
+_Suggested fix:_ Use `EXIT_UNAVAILABLE = 74` (or define `EXIT_INTERNAL = 70` as suggested in the 2026-06-08 entry) for this failure path.
 
 ---
 
@@ -612,65 +811,56 @@ validation, or delete it on failure.
 
 ### Security
 
-**[low] `private_temp_png` iterates index 0–999 and dies if all are taken, but does not randomise the index**
-`capture_screenshot.py:private_temp_png`
-As noted in the 2026-06-09 entry for `resolve_macos_with_helper`'s temp dir, the
-`{pid}.{index}` naming is predictable.  Within a `0o700` directory the attack surface
-is limited to same-user processes, but adding entropy to the filename is a defence-in-
-depth improvement.
-
-**[info] `find_macos_window_id.m` reads all windows with `kCGWindowListOptionAll`, which requires Screen Recording permission on macOS 14+**
-`scripts/find_macos_window_id.m`
-`CGWindowListCopyWindowInfo(kCGWindowListOptionAll, kCGNullWindowID)` returns an empty
-array (not nil) when Screen Recording permission has not been granted, rather than
-returning an error code.  The helper then finds no windows and exits with code 2
-("no matching window"), which the Python layer surfaces as "No matching on-screen
-window found" — a misleading message when the real cause is a missing permission.
-_Suggested fix:_ Before the window enumeration, check the permission status using
-`CGPreflightScreenCaptureAccess()` (available macOS 10.15+); if it returns false,
-print a diagnostic to stderr and exit with a dedicated code that the Python layer
-can map to a specific error message.
+**[low] `capture_screenshot.ps1:93` — `New-Item` uses `-Path` instead of `-LiteralPath` for directory creation**
+`capture_screenshot.ps1:93`
+Every other path operation in the script uses `-LiteralPath` (fourteen call-sites: `Get-Item`, `Test-Path`, `Get-Acl`, `Set-Acl`, `Move-Item`, `Remove-Item`, `Get-Item` for reparse-point check). The sole exception is the directory creation call:
+```powershell
+New-Item -ItemType Directory -Path $Path -Force | Out-Null
+```
+PowerShell's `-Path` parameter interprets wildcard metacharacters (`[`, `]`, `*`, `?`). If `$OutputRoot` contains literal brackets — for example, a user's desktop folder named `[screenshots]` — `New-Item -Path` may expand the pattern to zero or multiple matching paths and fail with a non-obvious error, or (in edge cases) silently create a directory at an unintended location. Critically, the ACL operations immediately after use `-LiteralPath $Path`, so the ACE is applied to the literal string while the directory may have been created via an expanded path — a mismatch.
+Python's `_validate_output_root` checks home-containment but does not strip wildcard characters from `$OutputRoot`, and when the PS script is invoked directly (without the Python orchestrator) there is no home-containment check at all (noted in 2026-06-08), leaving `$Path` fully user-controlled.
+_Suggested fix:_ Replace `New-Item -ItemType Directory -Path $Path -Force` with `New-Item -ItemType Directory -LiteralPath $Path -Force`, consistent with every other path operation in the script.
 
 ---
 
 ### Bugs & regressions
 
-**[medium] macOS `--target active` with `--destination clipboard` does not use the `--frontmost` helper path for plan construction**
-`capture_screenshot.py:main` and `plan_capture`
-For `target == "active"` on Darwin, `main` calls `resolve_macos_with_helper("", False, True, skill_dir)`
-to get the frontmost window ID, then extends `window_ids`.  `plan_capture` then
-receives `target="active"` and `window_ids=[id]` and falls into the `if not window_ids`
-guard (which does not fire) and then `for window_id in window_ids` to build
-screencapture commands.  This is correct.  However, the macOS `screencapture -l`
-command with a specific window ID and `-c` (clipboard) **requires** the window to be
-on the current Space; a window on a different Space is on-screen but `screencapture -l`
-may produce a black image.  This is an OS limitation, but the tool gives no warning.
+**[low] `capture_screenshot.ps1:22–62` — `Add-Type` inline C# recompiles on every fresh PowerShell process**
+`capture_screenshot.ps1:22`
+The 95-line inline C# block (Win32 P/Invoke declarations for `EnumWindows`, `GetWindowText`, `GetWindowRect`, `PrintWindow`, etc.) is compiled by `Add-Type` into a dynamic in-memory assembly at the start of every fresh PowerShell process. While PowerShell caches `Add-Type` results within a single runspace, each new `pwsh -File` invocation starts a fresh process with no cache. The compilation adds roughly 300–800 ms of fixed overhead to every capture request. The analogous macOS concern (clang recompiling `find_macos_window_id.m` on each call) was documented in the 2026-06-09 entry; the Windows path has the same class of latency issue.
+_Suggested fix:_ Pre-compile the Win32 declarations to a `.dll` at install time (`Add-Type -TypeDefinition ... -OutputAssembly scripts/Win32Capture.dll -OutputType Library`) and load it with `[System.Reflection.Assembly]::LoadFrom(...)` at runtime, recompiling only when the assembly is absent or outdated. This reduces per-invocation overhead to a single `Assembly.LoadFrom` call.
 
-**[low] `_linux_window_is_viewable` checks `"iconic"` in xprop output with a case-insensitive substring match**
-`capture_screenshot.py:_linux_window_is_viewable`
-`"iconic" not in proc.stdout.lower()` will flag any window whose xprop output contains
-the string "iconic" in any context (e.g., an icon-path that includes the word "iconic").
-In practice, `WM_STATE` output uses `window state: Iconic` as the canonical form, but
-a window whose `WM_ICON_NAME` contains "Iconic" could be misclassified as minimised.
-_Suggested fix:_ Parse the `WM_STATE` value more precisely, e.g., check that the line
-starts with `window state:` before testing for `Iconic`.
+**[info] `capture_screenshot.py:491` — `{temp-output}` dispatch assumes `plan.commands[0]` is a tuple, but `in` operator tests element membership, not substring**
+`capture_screenshot.py:491`
+```python
+if destination == "clipboard" and len(plan.commands) == 2 and "{temp-output}" in plan.commands[0]:
+```
+`plan.commands[0]` is a tuple of strings (e.g., `(grim, "{temp-output}")`). The `in` operator tests for exact element membership, not for a substring. This is correct for the current command structures, but the expression reads ambiguously to a maintainer who might think `in` is testing for a substring of a string. The 2026-06-12 entry documented the fragile `len == 2` guard; this note adds that the `in` check is also non-obvious in isolation.
+_Suggested fix:_ Add a comment: `# checks whether "{temp-output}" is one of the argument strings in the first command`, or rewrite as `any(part == "{temp-output}" for part in plan.commands[0])` to make the intent unambiguous.
 
 ---
 
 ### Data leaks
 
-No new findings.
+No new findings. All previously documented title-privacy invariants continue to hold in the reviewed code. The `New-Item -Path` issue could cause incorrect directory creation but would not expose window title metadata. The `Add-Type` compilation path involves no user data. Error messages for the newly analysed paths echo only static strings or the user-supplied query, never real window titles.
 
 ---
 
 ### UX
 
-**[info] `screencapture` on macOS plays a shutter sound even with `-x` flag on some system configurations**
-`capture_screenshot.py:plan_capture` (Darwin)
-`screencapture -x` is documented to suppress the shutter sound, but on certain macOS
-versions with "Play feedback when screenshot is taken" enabled in System Preferences,
-the sound plays regardless.  This is an OS-level limitation and not fixable in the
-script.
+**[low] `capture_screenshot.ps1` — clipboard destination may throw with MTA threading error when script is invoked directly without `-Sta`**
+`capture_screenshot.ps1:317–319`
+`[Windows.Forms.Clipboard]::SetImage($bitmap)` requires the calling thread to be in Single-Threaded Apartment (STA) mode. When the Python orchestrator invokes the PS script it explicitly passes `-Sta` (line 537 of `capture_screenshot.py`), ensuring the correct apartment state. However, if the script is invoked directly — e.g., `pwsh -File capture_screenshot.ps1 -ConsentConfirmed -Destination clipboard ...` — PowerShell 7+ (`pwsh`) defaults to MTA threading. `SetImage` then throws:
+```
+Current thread must be set to single thread apartment (STA) mode before OLE calls can be made.
+```
+This manifests as an unhandled terminating error (exit 1) with a .NET stack trace rather than a structured exit code. PowerShell 5.1 (`powershell.exe`) already defaults to STA, so only `pwsh` direct invocations are affected.
+_Suggested fix:_ Add a threading-model check near the top of the script and emit a clear error: `if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne [System.Threading.ApartmentState]::STA -and $Destination -eq 'clipboard') { [Console]::Error.WriteLine("clipboard capture requires STA threading — invoke with: pwsh -Sta -File capture_screenshot.ps1 ..."); exit 64 }`.
+
+**[info] No test exercises the `--allow-multiple-matches` + desktop path for a multi-window query returning more than one ID**
+`tests/test_capture_screenshot.py`
+`test_macos_allow_multiple_returns_all_capturable` (line 231) verifies that `resolve_macos_window_ids` returns multiple IDs, and `test_prepare_output_paths_suffixes_duplicate_labels_in_one_request` (line 53) verifies filename deduplication. However, there is no end-to-end integration test that runs the full `main()` with `--allow-multiple-matches`, a multi-window stub, and `--destination desktop`, verifying that (a) two separate `.png` paths are printed, (b) each path is unique, and (c) the `reserved`-set deduplication in `prepare_output_paths` is exercised in the subprocess path. A regression in the `labels.extend(...)` / `prepare_output_paths` interaction would be silent.
+_Suggested fix:_ Add an integration test using `CAPTURE_SCREENSHOT_TEST_WINDOWS` with two capturable windows and `--allow-multiple-matches --destination desktop --dry-run`, asserting two distinct output paths are printed on separate lines.
 
 ---
 
@@ -678,69 +868,58 @@ script.
 
 ### Security
 
-**[low] `_linux_window_is_viewable` runs `xprop -id {window_id}` with IDs from `xdotool search` output without re-validating them**
-`capture_screenshot.py:_linux_window_is_viewable`
-`xdotool search` returns IDs validated by `_validate_integer_ids` (digits-only check),
-so `xprop -id {window_id}` receives a numeric string.  Because `subprocess.run` uses a
-list (no shell), there is no shell injection risk.  However, `xprop` itself could be a
-malicious binary if `PATH` is untrusted (see the 2026-06-08 `shutil.which` note).
-The per-tool `tools` dict is built from `detect_tools`, so the path is fixed at
-detection time — an improvement over repeated `shutil.which` calls.
+**[medium] macOS Screen Recording permission denied on 10.15+ silently yields "no matching window" rather than a permission diagnostic**
+`scripts/find_macos_window_id.m:67`
+On macOS Catalina (10.15) and later, `CGWindowListCopyWindowInfo(kCGWindowListOptionAll, kCGNullWindowID)` requires the Screen Recording permission. When that permission has been denied (or revoked), the API does NOT return `NULL` — it returns a non-NULL `CFArrayRef` containing only windows belonging to the calling process itself (the transient helper binary has no windows), filtered of title strings. The existing NULL guard at line 70 (`if (!windows) { return 1; }`) therefore never fires. The loop iterates zero or near-zero entries, so `capturable_count == 0` and `present_count == 0`; the helper exits with code 2. Python maps code 2 to `ResolutionResult(False, "no_matching_window", "No matching on-screen window found.")`. The user receives a misleading usage-style error with no indication that the Screen Recording permission must be granted in System Preferences → Privacy & Security. This undermines the consent-enforcement story: macOS's OS-level gate is the primary safeguard for the window-title enumeration, so its silent failure mode is security-relevant, not just cosmetic.
+_Suggested fix:_ After `CGWindowListCopyWindowInfo` returns a non-NULL but zero-count array, emit a specific token on stderr (e.g., `screen_recording_denied`) and return exit code 5. In Python's `resolve_macos_with_helper`, map exit code 5 to a new `ResolutionResult(False, "screen_recording_permission_denied", "Screen Recording permission is required — grant it in System Preferences → Privacy & Security → Screen Recording, then retry.")`.
 
-**[info] `find_macos_window_id.m` does not verify that `query_arg` is valid UTF-8 before calling `CFStringCreateWithCString`**
-`scripts/find_macos_window_id.m`
-`CFStringCreateWithCString(NULL, query_arg, kCFStringEncodingUTF8)` returns NULL if
-`query_arg` is not valid UTF-8.  The code checks the return value (`if (!query)`)
-and returns 64 on NULL, so this is handled correctly.  Recorded as info because the
-error message to stderr on this path is empty (the check just `return 64`), which is
-opaque to the user.
-_Suggested fix:_ Print `"error: query is not valid UTF-8\n"` to stderr before returning 64.
+**[low] `ensure_private_directory` with `parents=True` secures only the leaf directory; intermediate parents created by Python's `mkdir` use default permissions**
+`capture_screenshot.py:108`
+`path.mkdir(mode=0o700, parents=True, exist_ok=True)` follows Python's documented `parents=True` semantics: only the leaf directory receives the supplied `mode`; missing intermediate ancestors are created with the default mode (typically `0o755`, further modified by umask). If a user supplies a deep `--output-root` such as `~/new_project/captures/screenshots` where `new_project/captures` does not yet exist, those ancestors are created world-traversable. Other users on a shared machine can therefore observe the existence of the directory hierarchy (but not its contents). The subsequent `path.chmod(0o700)` call only tightens the leaf. In the default case (`~/Desktop/screenshots`), `~/Desktop` already exists, so no new intermediary is created and this is benign; the risk appears only when a non-standard `--output-root` with non-existent parents is used.
+_Suggested fix:_ Walk the ancestors from the deepest existing one down and `chmod(0o700)` each newly created directory, or use a manual `os.makedirs`-equivalent that passes the mode to each created level. Alternatively, add documentation that `--output-root` parents must already exist.
 
 ---
 
 ### Bugs & regressions
 
-**[medium] `Protect-Directory` in PowerShell does not remove pre-existing ACE entries before adding the owner-only rule**
-`scripts/capture_screenshot.ps1:Protect-Directory`
-`$acl.SetAccessRuleProtection($true, $false)` disables inheritance and removes
-inherited entries, but *explicit* ACEs on a pre-existing directory are not purged
-before `$acl.AddAccessRule($rule)` is called.  A directory that was previously
-world-writable (or shared with other users) retains its explicit ACEs even after
-`Protect-Directory` runs on it.
-_Suggested fix:_ After `SetAccessRuleProtection`, iterate `$acl.Access` and call
-`$acl.RemoveAccessRule($_)` for each existing rule before adding the owner-only ACE,
-as is already done correctly in `Protect-File`.
+**[medium] `--query` values are silently discarded when `--target` is `fullscreen` or `active`; no warning is emitted**
+`capture_screenshot.py` (`main()`, fullscreen/active branches ~line 591–596)
+`parse_args` defines `--query` as an optional `append` argument with no constraint on which `--target` values it may accompany. In `main()`, `args.query` is consumed only inside the `if args.target == "window":` branch. When `--target fullscreen` or `--target active` is used with one or more `--query` values — e.g., `--target fullscreen --query Safari` — those queries are silently ignored and a full-screen or active-window capture proceeds. The user may have intended to narrow the scope (e.g., believing `--query` filters a multi-monitor fullscreen to one display), receiving instead a much wider capture than requested. This contradicts the privacy-first principle of never broadening scope silently.
+_Suggested fix:_ After the target branch selection, add a guard:
+```python
+if args.query and args.target != "window":
+    die(f"--query is only valid with --target window (got --target {args.target})", EXIT_USAGE)
+```
+Add a corresponding test asserting `EXIT_USAGE` when `--query` is supplied with a non-window target.
 
-**[low] `Copy-Window` disposes `$graphics` in a `finally` block but does not dispose `$bitmap` on `PrintWindow` failure before the `throw`**
-`scripts/capture_screenshot.ps1:Copy-Window`
-Inside the `try` block: if `PrintWindow` returns `$false`, `$bitmap.Dispose()` is
-called and then `throw` is executed.  The `finally` block then calls
-`$graphics.Dispose()`.  Because `$bitmap` was disposed before the throw, the `finally`
-block does not double-dispose it.  However, the `$graphics` object holds a reference
-to the already-disposed bitmap's HDC.  In practice, `ReleaseHdc` is called in its own
-`finally` before `graphics.Dispose()`, so the sequencing is: `GetHdc` → `PrintWindow`
-→ (failure) `ReleaseHdc` (in inner `finally`) → `bitmap.Dispose()` → `throw` →
-`graphics.Dispose()` (outer `finally`).  This sequence is correct; noted because the
-nested `finally` blocks are non-obvious.
+**[low] PowerShell default `$OutputRoot` resolves to a relative path on Windows Server Core where `GetFolderPath('Desktop')` returns an empty string**
+`capture_screenshot.ps1:8`
+The default parameter value is:
+```powershell
+[string]$OutputRoot = (Join-Path ([Environment]::GetFolderPath('Desktop')) 'screenshots')
+```
+On Windows Server Core, Nano Server, and container images without a desktop shell, `[Environment]::GetFolderPath('Desktop')` returns an empty string `""`. `Join-Path "" 'screenshots'` evaluates to `screenshots` (a bare relative path). When the script is invoked directly without the Python orchestrator (which always passes `-OutputRoot` explicitly), `Protect-Directory -Path 'screenshots'` creates a directory named `screenshots` in whatever the current working directory happens to be — potentially outside the user's home. Combined with the previously documented absence of home-containment enforcement in the PS script (2026-06-08), this creates a path where screenshots land in an unintended, unprotected location.
+_Suggested fix:_ Change the default to `(Join-Path ([Environment]::GetFolderPath('UserProfile')) 'Desktop\screenshots')` or validate at the top of the script that `$OutputRoot` is non-empty and rooted, failing with a structured message if not.
 
 ---
 
 ### Data leaks
 
-No new findings.  `Protect-Directory` ACE fix (above) is a security hardening item,
-not a data-leak finding.
+No new findings. The `--query` silent-discard bug (above) routes the discarded query values to oblivion rather than to any output or log, so no title or query text is exposed. The Screen Recording permission failure path emits only the static exit code 2 and a static string; no window title information reaches the helper's output. All previously documented title-privacy invariants continue to hold in the reviewed code.
 
 ---
 
 ### UX
 
-**[info] PowerShell error output on `throw` uses the exception message directly, which may include internal path information**
-`scripts/capture_screenshot.ps1`
-Several `throw 'message'` statements produce PowerShell `RuntimeException` objects.
-In `$ErrorActionPreference = 'Stop'` mode these are fatal, but the message is printed
-with full PowerShell exception formatting (including script path and line number) to
-stderr.  This is consistent with other PowerShell scripts but differs from the Python
-layer's `die()` convention of printing only the message.
+**[medium] No diagnostic path exists when macOS Screen Recording permission is missing or denied**
+`scripts/find_macos_window_id.m:67`, `capture_screenshot.py:resolve_macos_with_helper`
+(Same root cause as the security finding above.) When Screen Recording permission is absent, every named-window and active-window request on macOS fails with the generic "no_matching_window" / "No matching on-screen window found" message. The user has no indication that the problem is a system permission rather than a typo in the app name. The error message for `no_matching_window` suggests checking the window name, sending the user on a fruitless debugging path. A first-time installer is especially likely to hit this: the skill's `install.sh` grants no permission automatically, and the OS's permission prompt may have been dismissed or may not appear until the Screen Recording permission is triggered — which it currently isn't because the failed API call returns a partial result rather than failing visibly.
+_Suggested fix:_ Same as the security finding: add an exit code 5 from the helper and map it to a human-readable permission guidance message in Python.
+
+**[low] `test_skill_notice_documents_privacy_consent_and_intended_use` raises `FileNotFoundError` rather than a descriptive assertion failure if `SKILL.md` is absent or renamed**
+`tests/test_capture_screenshot.py:SKILL_MD` (module level, line ~13)
+`SKILL_MD = ROOT / "SKILL.md"` is defined at module level and used inside the test as `SKILL_MD.read_text(encoding="utf-8")`. If the file does not exist (e.g., renamed to `skill.md` on a case-sensitive filesystem, or deleted), the test fails with an unhandled `FileNotFoundError` rather than an assertion failure, which obscures the root cause when running the full test suite.
+_Suggested fix:_ Wrap the `read_text` call in a `try/except FileNotFoundError` or add `self.assertTrue(SKILL_MD.exists(), "SKILL.md not found — is the file path correct?")` as the first assertion in the test.
 
 ---
 
@@ -748,70 +927,69 @@ layer's `die()` convention of printing only the message.
 
 ### Security
 
-**[medium] `Protect-Directory` ACE purge gap confirmed: pre-existing explicit ACEs survive `SetAccessRuleProtection`**
-`scripts/capture_screenshot.ps1:Protect-Directory` (revisit of 2026-06-16 finding)
-The 2026-06-16 entry identified that explicit ACEs on an existing directory are not
-removed.  Confirmed that `$acl.SetAccessRuleProtection($true, $false)` removes only
-*inherited* ACEs; explicit ACEs require explicit removal.  The fix identified
-(iterate + `RemoveAccessRule`) is correct.  The `Protect-File` function already
-applies this fix correctly (iterates `$acl.Access` and removes all rules before adding
-the owner rule), confirming the pattern is known within the codebase.  The gap applies
-only to `Protect-Directory` when the directory pre-exists with foreign explicit ACEs
-(e.g., if the user previously shared the screenshots folder).  Status: **unresolved**.
+**[low] Helper compilation temp directory is visible in world-traversable `/tmp`, leaking capture timing metadata to co-tenants**
+`capture_screenshot.py:337` (`resolve_macos_with_helper`)
+`tempfile.TemporaryDirectory(prefix="screenshot-window.")` creates a directory in the system temp directory (typically `/tmp` on Linux/macOS). The temp directory itself is created with mode 0o700 (contents are protected), but its existence in the world-traversable `/tmp` (mode 0o1777) is visible to any user who can run `ls /tmp`. A co-tenant can therefore observe that a `screenshot-window.XXXXXX` directory exists, deduce that a macOS named-window or active-window capture is in progress, and correlate its creation timestamp to infer capture timing. The directory content (compiled helper binary, window IDs emitted at runtime) remains protected. This is distinct from the 2026-06-08 finding (clipboard temp PNG in `/tmp`): the desktop-path temp file is created inside a 0o700 request directory so metadata is also hidden, but the compilation directory does not receive the same treatment.
+_Suggested fix:_ Create the compilation temp directory inside a pre-existing private directory (e.g., under the same `ensure_private_directory`-created output root, or a `tempfile.mkdtemp()` inside the user's home), ensuring the directory name is not visible in world-traversable space. If a home-rooted location is impractical for the compile step, at minimum note in privacy documentation that capture attempts create a visible directory entry in `/tmp`.
 
-**[low] `resolve_macos_with_helper` compiles to a path inside a world-listable `/tmp` subdirectory**
-`capture_screenshot.py:resolve_macos_with_helper`
-`tempfile.TemporaryDirectory(prefix="screenshot-window.")` creates a directory in
-`/tmp`.  While the directory itself is `0o700` (Python 3.10+ default), its *name*
-(including the `screenshot-window.` prefix) is visible to all local users via `ls /tmp`
-or filesystem event watchers (FSEvents on macOS, inotify on Linux).  The existence and
-timing of window captures is thus metadata-leaked to other local users.  Repeated
-across multiple captures, this creates an activity log visible to any local observer.
-(Related to the 2026-06-08 entry; now specifically about the compilation temp dir in
-addition to the capture temp dir.)
+**[low] `sanitize_label` strips only `http://` and `https://` schemes; other URL-like schemes (`ftp://`, `file://`, `mailto:`) are not removed**
+`capture_screenshot.py:71`, `capture_screenshot.ps1:69`
+```python
+label = re.sub(r"https?://", "", label)
+```
+and
+```powershell
+$label = $Value.ToLowerInvariant() -replace 'https?://', ''
+```
+A window title containing `ftp://my.server/private-path` or `file:///etc/internal-notes` produces a sanitized label such as `ftp-my-server-private-path` or `file-etc-internal-notes`. No path traversal is possible (all non-alphanumeric characters subsequently become `-`), and the scheme component leaks no more information than the rest of the title would. However, the scheme prefix (`ftp-`, `file-`) remains in the filename, partly defeating the purpose of URL-stripping (which presumably targets privacy — keeping server names out of filenames when a browser tab title contains a URL). Both the Python and PowerShell implementations mirror this narrow pattern; it appears intentional for HTTP/HTTPS only, but is undocumented.
+_Suggested fix:_ Broaden the pattern to strip any URL scheme: `re.sub(r"[a-z][a-z0-9+\-.]*://", "", label, flags=re.I)` (RFC 3986 scheme grammar) and apply the same change to the PowerShell equivalent. Or add a comment explaining why only HTTP/HTTPS schemes are intentionally removed.
 
 ---
 
 ### Bugs & regressions
 
-**[medium] `Protect-Directory` in PowerShell is called on the output root and the per-request subfolder, but if `Protect-Directory` on the subfolder fails, the output root's new ACLs have already been applied**
-`scripts/capture_screenshot.ps1:New-RequestFolder`
-`Protect-Directory -Path $OutputRoot` is called first, then
-`Protect-Directory -Path $folder`.  If the second call throws (e.g., the subfolder
-path is a reparse point added between the two calls), the function exits with an
-exception but `$OutputRoot`'s ACLs have already been tightened.  This is actually
-the desired outcome (a partial success is better than no hardening), but it means a
-caller catching the exception cannot know whether `$OutputRoot` was secured.  Not a
-correctness bug, but a subtle contract issue.
+**[medium] Windows `GetWindowRect` returns DWM extended-frame bounds including invisible drop-shadow margin, causing stray pixels in captured images**
+`capture_screenshot.ps1:225–246` (`Get-WindowBounds`, `Copy-Rectangle`, `Copy-Window`)
+On Windows Vista and later with Desktop Window Manager (DWM) enabled, `GetWindowRect` returns the "extended frame" bounds for DWM-composited windows, which include an invisible drop-shadow region — typically 7–9 logical pixels on each side. When `Copy-Rectangle` is used (for fullscreen and as the screen-blit path in `Copy-Window` fallback), the bitmap dimensions are based on these extended bounds and `CopyFromScreen` captures the corresponding screen region: the shadow margin pixels contain whatever is rendered behind the window at those positions (desktop or neighboring window content). For the `Copy-Window` path (`PrintWindow` + GDI+), the DC is also sized to the extended bounds; pixels in the shadow margin are not written by `PrintWindow` and remain as the zero-initialized GDI+ color (black), producing a narrow black border around the actual window content in the saved PNG. The Windows API `DwmGetWindowAttribute(hWnd, DWMWA_EXTENDED_FRAME_BOUNDS, &rect, sizeof(rect))` returns the visible client-frame bounds excluding the shadow, matching what the user sees on screen.
+_Suggested fix:_ Add a `DwmGetWindowAttribute` P/Invoke signature to the inline C# block in the PowerShell script and update `Get-WindowBounds` to prefer `DWMWA_EXTENDED_FRAME_BOUNDS` over `GetWindowRect` for any window handle that is not zero (i.e., for named and active captures). Fall back to `GetWindowRect` when the DWM call fails (e.g., non-DWM window or Windows Server Core). Fullscreen capture already uses `SystemInformation.VirtualScreen` and is unaffected.
 
-**[low] `resolve_linux_named_window` does not distinguish between xdotool returning zero results and xdotool failing (non-zero exit)**
-`capture_screenshot.py:resolve_linux_named_window`
-`if proc.returncode != 0: return ResolutionResult(False, "no_matching_window", …)`.
-`xdotool search` exits with code 1 when no windows match *and* when an internal error
-occurs (e.g., cannot connect to the X server).  Both cases produce the same
-"no_matching_window" result, masking X11 connectivity issues.
-_Suggested fix:_ Check stderr for error messages; if xdotool reports an X11 connection
-failure, return a more specific error code (e.g., `"x11_unavailable"`).
+**[low] `test_windows_delegates_to_powershell` embeds temp file path in shell script without quoting, fragile on paths with spaces**
+`tests/test_capture_screenshot.py:309`
+```python
+fake_ps.write_text(
+    f'#!/bin/sh\nprintf "%s\\n" "$@" > {args_file}\necho "fake/path.png"\n'
+)
+```
+`args_file` is a `Path` object whose string representation is interpolated directly into the shell script without quoting. On macOS, `tempfile.TemporaryDirectory()` creates directories under `/private/var/folders/…` (which currently contains no spaces), and on Linux under `/tmp/tmpXXXXXX`. If a CI runner configures `TMPDIR` to a path with spaces (not uncommon on macOS GitHub Actions), the shell redirect `> /path with spaces/file.txt` would be parsed incorrectly, causing the fake `powershell.exe` to fail with a shell error rather than writing the expected args file. The test would then report a false failure in `captured = args_file.read_text()` (FileNotFoundError) rather than in the code under test, obscuring the root cause.
+_Suggested fix:_ Quote the path in the shell script: `f'#!/bin/sh\nprintf "%s\\n" "$@" > "{args_file}"\necho "fake/path.png"\n'`, or use `shlex.quote(str(args_file))` to handle any metacharacters robustly.
 
 ---
 
 ### Data leaks
 
-No new findings.
+No new findings. The DWM shadow-margin pixels captured by `Copy-Rectangle` are rendered screen content of neighboring windows or the desktop (pixel data only, not window title metadata). The helper compilation temp directory in `/tmp` leaks existence and timing metadata, as documented above under Security, but not window IDs or image content. The incomplete URL scheme stripping in `sanitize_label` could leave `ftp-` or `file-` prefixes in filenames, but not server names or path segments beyond what the full label sanitization already permits. All previously documented title-privacy invariants continue to hold across all three platform paths.
 
 ---
 
 ### UX
 
-**[info] `not_capturable_message` for `state="unknown"` does not tell the user what actions to take beyond "restore it"**
-`capture_screenshot.py:not_capturable_message`
-The generic message `"'{query}' exists but cannot be captured (minimized or off-screen)
-— restore it and retry."` does not explain that on macOS, "another Space" may be the
-cause and switching Spaces is the remedy.  The `state="offscreen"` branch handles this
-correctly; the `"unknown"` branch does not.
-_Suggested fix:_ Update the `"unknown"` branch message to: `"'{query}' exists but
-cannot be captured — it may be minimized or on another Space. Restore the window or
-switch to its Space, then retry."`
+**[low] WSL (Windows Subsystem for Linux) is not detected; capture attempts silently fall through to tool-not-found errors with no platform guidance**
+`capture_screenshot.py:570` (`main()`, platform detection)
+On WSL, `platform.system()` returns `"Linux"`, so the code enters the Linux path. WSL environments typically have no X display server, Wayland compositor, or GNOME session running. All tool detections via `detect_tools()` return empty results, and `plan_capture` exits with `missing_dependency_fullscreen` or `missing_dependency_named_window`. The error message gives no indication that the running environment is WSL or that the Windows native capture path (invoking the script from PowerShell directly) should be used instead. CONTRIBUTING.md acknowledges this gap under "Good first issues" item 5.
+_Suggested fix:_ Detect WSL by reading `/proc/version` for the substring `microsoft` or `WSL` (case-insensitive) before the Linux tool-detection block, and `die("WSL is not a supported capture environment — run the script from a native Windows PowerShell session to use the Windows capture path", EXIT_UNAVAILABLE)`.
+
+**[info] CONTRIBUTING.md code snippet for `plan_capture()` shows `(session_type or "").lower()` but the real implementation also falls back to `os.environ.get("XDG_SESSION_TYPE")`**
+`CONTRIBUTING.md:35–44`, `capture_screenshot.py:234`
+The CONTRIBUTING.md example shows:
+```python
+session = (session_type or "").lower()
+```
+The actual code is:
+```python
+session = (session_type or os.environ.get("XDG_SESSION_TYPE") or "").lower()
+```
+A contributor following the docs snippet would omit the environment variable fallback and potentially produce a plan that ignores `XDG_SESSION_TYPE` when `session_type` is an empty string, introducing a silent regression. The discrepancy is cosmetic (a simplified example), but could mislead a contributor adding a new session type branch.
+_Suggested fix:_ Update the CONTRIBUTING.md snippet to match the actual code or add a comment noting that the snippet is simplified and contributors should read the actual function signature.
 
 ---
 
@@ -819,79 +997,125 @@ switch to its Space, then retry."`
 
 ### Security
 
-**[medium] `Protect-Directory` ACE purge gap resolved in current codebase**
-`scripts/capture_screenshot.ps1:Protect-Directory`
-Reviewing the current `main` branch: the `Protect-Directory` function now includes
-`foreach ($rule in @($acl.Access)) { $acl.RemoveAccessRule($rule) | Out-Null }` after
-`SetAccessRuleProtection`, purging all pre-existing explicit ACEs before adding the
-owner-only rule.  This resolves the finding from 2026-06-16/17.  Status: **fixed**.
+**[low] `secure_file()` catches `PermissionError` only, not the full `OSError` hierarchy**
+`capture_screenshot.py:117–121`
+```python
+def secure_file(path: Path) -> None:
+    try:
+        path.chmod(0o600)
+    except PermissionError:
+        die("could not secure screenshot file permissions", EXIT_PRIVACY)
+```
+`path.chmod()` may raise other `OSError` subclasses: `FileNotFoundError` (ENOENT, if the file
+was deleted between creation and the chmod call), `OSError` with `EROFS` (read-only filesystem),
+or `NotADirectoryError`. These propagate as unhandled Python exceptions — a raw traceback with
+exit code 1 — rather than a structured `die()` message. In practice the file is always freshly
+created by `private_temp_png` or `os.replace`, making ENOENT very unlikely, but the narrow
+`except PermissionError` leaves other error modes unhandled in a privacy-critical path.
+_Suggested fix:_ Broaden the catch to `except OSError as e:` and use
+`die(f"could not secure screenshot file permissions: {e.strerror}", EXIT_PRIVACY)`, consistent
+with the intent of the surrounding code.
 
-**[low] `capture_screenshot.ps1` does not validate `-OutputRoot` is within the user profile when invoked directly**
-`scripts/capture_screenshot.ps1` (parameter block, top of script)
-The Python orchestrator (`capture_screenshot.py:_validate_output_root`) enforces
-home-directory containment before delegating to PowerShell, so the guard fires for
-typical invocations.  However, a caller who runs `capture_screenshot.ps1` directly
-(bypassing Python) can pass an arbitrary `-OutputRoot` (e.g., a network share or a
-system path).  The script will create and ACL-secure whatever path is supplied without
-error.  This was flagged in the 2026-06-08 and 2026-06-10 entries; noting here that
-it remains unresolved on the current `main` branch.  Status: **unresolved**.
-
-**[info] `find_macos_window_id.m` compiled binary lives in `/tmp` subdirectory visible via `ls /tmp`**
-Previously flagged in 2026-06-08 and 2026-06-17.  Remains unresolved.
+**[low] `Copy-Window` leaks GDI `$bitmap` if `FromImage` or `GetHdc` raises before the outer `finally`**
+`capture_screenshot.ps1:255–271`
+```powershell
+$bitmap = [Drawing.Bitmap]::new($Bounds.Width, $Bounds.Height)
+$graphics = [Drawing.Graphics]::FromImage($bitmap)   # could throw
+try {
+    $hdc = $graphics.GetHdc()                         # could throw
+    ...
+} finally {
+    $graphics.Dispose()
+}
+```
+If `FromImage` throws (e.g., out-of-GDI-handle condition), `$graphics` is never assigned and
+`$bitmap` is never disposed, because the `try/finally` is never entered. Likewise if `GetHdc`
+throws, the outer `finally` disposes `$graphics` but `$bitmap` is not cleaned up (the `if -not
+$ok` path that calls `$bitmap.Dispose()` is never reached). The bitmap allocated on line 255 is
+then leaked until the process exits. `Capture-ToDestination`'s own `try/finally` does not cover
+this allocation because `Copy-Window` throws rather than returning `$bitmap`. In practice,
+`FromImage` and `GetHdc` rarely fail on a freshly allocated bitmap, but GDI exhaustion on
+resource-constrained systems can trigger this.
+_Suggested fix:_ Restructure `Copy-Window` with a trap around the full allocation block, or move
+the `$bitmap` disposal into the same `finally` as `$graphics`: at function exit, if `$bitmap`
+is not being returned (i.e., an exception is in flight), call `$bitmap.Dispose()`.
 
 ---
 
 ### Bugs & regressions
 
-**[medium] `Copy-Rectangle` on Windows does not handle negative-coordinate windows (e.g., windows on a monitor to the left of the primary)**
-`scripts/capture_screenshot.ps1:Copy-Rectangle`
-`Graphics.CopyFromScreen` accepts negative `Left`/`Top` coordinates (valid for
-multi-monitor setups where the primary monitor is not the leftmost).  However,
-`Get-WindowBounds` checks `$width -le 0 -or $height -le 0` and throws on zero/negative
-dimensions.  A window with `Left=-1920` (on the monitor to the left of primary) has
-positive width and height, so it is not rejected.  `CopyFromScreen` with negative
-source coordinates works correctly on Windows (the virtual screen coordinate system
-allows negatives); this item is withdrawn — the code handles it correctly.
-Status: **not a bug**.
+**[low] `clang` compilation has no `capture_output=True`; compiler diagnostics emit on the user's terminal**
+`capture_screenshot.py:339`
+```python
+subprocess.run([clang, "-framework", "ApplicationServices", str(helper_source), "-o", str(helper)], check=True)
+```
+The helper binary's runtime output is captured (`capture_output=True` on line 347), but the
+`clang` compilation step is not. Any warnings clang emits (e.g., implicit-function-declaration
+notes, SDK deprecation notices) go directly to the calling process's stderr, intermixed with the
+script's own output. A user running a normal `--target window` request would see unexpected clang
+diagnostic lines that give no actionable guidance. When compilation fails (already noted as the
+2026-06-09 bug), the error is already visible on terminal before the unhandled `CalledProcessError`
+propagates; this finding is about the success path also leaking diagnostics.
+_Suggested fix:_ Add `stderr=subprocess.PIPE` (or `capture_output=True`) to the clang invocation
+and include `e.stderr` in the structured `ResolutionResult` message if compilation fails (the fix
+proposed in the 2026-06-09 entry would naturally capture stderr at that point).
 
-**[low] `plan_capture` for Linux `target=active` returns `missing_dependency_active_window` even when `xdotool` is present (because gnome-screenshot is the only supported active-window tool)**
-`capture_screenshot.py:plan_capture` (Linux active branch)
-The Linux `active` branch only checks for `gnome-screenshot`.  If `gnome-screenshot`
-is absent but `xdotool` is present, the error is `missing_dependency_active_window`.
-`xdotool getactivewindow` + `import -window {id}` is a viable alternative that is
-not attempted.  The user gets a misleading "no active-window tool" error when the
-ingredients are available.
-_Suggested fix:_ Add an `xdotool`+`import` fallback for active-window on X11.
-
-**[medium] `test_windows_delegates_to_powershell` test uses an inline shell script with a path embedded in a printf command — shell-injection risk in test code**
-`tests/test_capture_screenshot.py:test_windows_delegates_to_powershell`
-The fake PowerShell script writes:
-`f'#!/bin/sh\nprintf "%s\\n" "$@" > {args_file}\necho "fake/path.png"\n'`
-`args_file` is a `Path` inside a `tempfile.TemporaryDirectory`.  If `args_file`
-contains shell-special characters (e.g., spaces, `$`, backticks), the embedded path
-in the heredoc-style script would cause unintended shell behaviour when `/bin/sh`
-executes it.  `tempfile.TemporaryDirectory` typically produces paths under `/tmp`
-without special characters, so the risk is negligible in practice, but the pattern is
-fragile.
-_Suggested fix:_ Write `args_file` path to an env variable and use `"$ARGS_FILE"`
-in the script, or use `shlex.quote(str(args_file))` when embedding the path.
+**[low] `resolve_linux_named_window` calls `_linux_window_is_viewable` for every matched ID before the `allow_multiple` count check**
+`capture_screenshot.py:405–416`
+```python
+classified = [(wid, _linux_window_is_viewable(wid, tools)) for wid in ids]
+if any(state is None for _, state in classified):
+    capturable = ids
+else:
+    capturable = tuple(wid for wid, state in classified if state)
+    ...
+if len(capturable) > 1 and not allow_multiple:
+    return ResolutionResult(False, "multiple_matches", ...)
+```
+`_linux_window_is_viewable` calls `subprocess.run([xprop, ...])` or `subprocess.run([xwininfo, ...])`
+for each window ID. When a query matches N windows (e.g., a common app name) and
+`allow_multiple=False`, the function performs N subprocess round-trips before concluding
+"multiple matches" and returning an error. Even when the second ID makes the multiple-match
+outcome certain, all remaining IDs are still classified. On a machine where xprop is slow or the
+X server is under load, this adds noticeable latency proportional to N. Combined with the
+no-timeout concern (2026-06-11 entry), a single hung `xprop` call blocks all subsequent
+classifications.
+_Suggested fix:_ In the `not allow_multiple` path, break out of the classification loop as soon
+as two capturable IDs have been found — a short-circuit that avoids all remaining subprocess
+calls. The `allow_multiple` path must still classify all IDs.
 
 ---
 
 ### Data leaks
 
-No new findings.  Window title exclusion remains intact across all reviewed paths.
+No new findings. All previously documented title-privacy invariants continue to hold across all
+three platform paths. The `clang` diagnostic output (bugs above) includes only source-file paths
+and compiler codes, not window titles or user data. The GDI bitmap leak involves only pixel data
+in kernel-managed memory, inaccessible to other processes. Error messages on all three platforms
+continue to echo only the user-supplied query text, never real window titles retrieved from the OS.
 
 ---
 
 ### UX
 
-**[info] `execute_plan` prints output paths one per line, but on Windows the paths contain backslashes**
-`capture_screenshot.py:execute_plan`
-`print(output)` prints the `Path` object, which on Windows uses backslashes.  Callers
-parsing the output with forward-slash assumptions (e.g., a shell script expecting
-POSIX paths) would need to normalise separators.  This is expected Python/Windows
-behaviour but worth documenting in SKILL.md.
+**[info] `clang` compile warnings appear on user terminal during normal operation**
+`capture_screenshot.py:339`
+(Same root cause as the bugs finding above.) From a user-experience perspective, a normal
+`--target window` capture might print clang warnings such as deprecation notices or
+implicit-conversion notes before the screenshot path is printed. These lines have no meaning
+to an end user and provide no remediation guidance. On macOS systems where the Xcode Command
+Line Tools version diverges from the SDK, deprecation warnings can appear even for clean source.
+_Suggested fix:_ Same as the bugs entry above — redirect the compile stderr to `subprocess.PIPE`
+and surface it only in structured error messages on failure.
+
+**[low] `resolve_linux_named_window` performs unnecessary subprocess round-trips on common-name queries**
+`capture_screenshot.py:405–416`
+(Same root cause as the bugs finding above, UX angle.) A user querying a common process name
+(e.g., `--query "a"`, `--query "Code"`) on a desktop with many open windows experiences latency
+proportional to the match count before receiving the "multiple matches" error, with no progress
+indication. The delay is invisible because the script produces no interim output.
+_Suggested fix:_ Same as the bugs entry — short-circuit classification after two capturable
+matches are found when `allow_multiple=False`.
 
 ---
 
@@ -899,63 +1123,116 @@ behaviour but worth documenting in SKILL.md.
 
 ### Security
 
-**[medium] `_test_windows` JSON parsing has no size guard — a very large `CAPTURE_SCREENSHOT_TEST_WINDOWS` value causes unbounded memory allocation**
-`capture_screenshot.py:_test_windows`
-`json.loads(raw)` on a very large string (e.g., a 100 MB environment variable set by a
-hostile environment) would allocate proportional memory.  In practice, environment
-variables are limited to a few MB on most OSes (Linux ARG_MAX / env size limits apply),
-and the variable is a test hook; the risk is negligible.  Recorded for completeness.
+**[low] `ensure_private_directory` has the same narrow error-catch pattern as the 2026-06-18 `secure_file` finding**
+`capture_screenshot.py:107,112`
+`path.mkdir(mode=0o700, parents=True, exist_ok=True)` (line 107) and `path.stat()` (line 112) are
+outside the `try/except PermissionError` block that guards only `path.chmod()`. If `mkdir` fails
+with `OSError(ENOSPC)` (disk full), `OSError(EROFS)` (read-only filesystem), or
+`NotADirectoryError` (a parent path component is a regular file), the exception propagates as an
+unhandled Python traceback with exit code 1. In a privacy-critical path where the output directory
+is being secured before any screenshot data is written, these failure modes should surface as
+structured `die()` messages. The 2026-06-18 entry documented the identical pattern in `secure_file`;
+this finding extends it to the sibling function `ensure_private_directory`.
+_Suggested fix:_ Wrap both `path.mkdir()` and `path.stat()` in a `try/except OSError as e:` block
+and call `die(f"could not create private screenshots directory: {e.strerror}", EXIT_PRIVACY)`,
+consistent with the approach proposed for `secure_file`.
 
-**[low] `_validate_integer_ids` does not enforce an upper bound on window ID values**
-`capture_screenshot.py:_validate_integer_ids`
-`id_str.isdigit()` accepts arbitrarily large integers.  A misbehaving helper that emits
-a 20-digit string would pass the check and be forwarded to `screencapture -l` or
-`import -window`.  The tools would likely fail gracefully (invalid window ID), but the
-unbounded integer is not explicitly bounded to `uint32_t` range (the actual CGWindowID
-or X11 XID range).
-_Suggested fix:_ Add `int(id_str) <= 2**32 - 1` to the validation, matching the
-`uint32_t` range of both CGWindowID and X11 XID.
+**[low] `_validate_output_root` validates the resolved path but passes the original (potentially relative) string to PowerShell**
+`capture_screenshot.py:522–527, 541`
+`_validate_output_root(path)` calls `path.resolve()` (line 525) to obtain the canonical absolute
+path for the home-containment check. However, `_run_powershell_script` passes `str(args.output_root)`
+(line 541) — the original, unresolved value — to PowerShell via `-OutputRoot`. If the user supplies
+a relative `--output-root` such as `--output-root screenshots`, Python resolves `screenshots` to an
+absolute path (e.g., `/home/user/projects/screenshots`) and validates that result. PowerShell
+receives the bare string `"screenshots"` and uses `Protect-Directory -Path 'screenshots'`, creating
+the directory relative to PowerShell's inherited cwd. Because Python and the PowerShell subprocess
+share the same working directory (subprocess inherits the parent's cwd), the effective absolute
+path is identical in practice, so this is not an active vulnerability. It is, however, a latent
+maintenance hazard: any future change that sets a different `cwd=` in the `subprocess.run` call
+inside `_run_powershell_script` would silently break the invariant that the validated path and the
+used path are the same.
+_Suggested fix:_ Pass `str(args.output_root.resolve())` to PowerShell to make the absolute-path
+guarantee explicit and robust to future refactoring.
 
 ---
 
 ### Bugs & regressions
 
-**[medium] `resolve_macos_with_helper` with `active=True` ignores `allow_multiple` — always passes `False` to `resolve_macos_window_ids` in the test path**
-`capture_screenshot.py:resolve_macos_with_helper`
-When `test_windows` is set and `active=False`, `resolve_macos_window_ids(query, test_windows, allow_multiple=allow_multiple)` is called.  When `active=True`, the test-windows path is skipped entirely (correct).  However, the live path (`subprocess.run(command, …)`) passes `--allow-multiple` only when `allow_multiple` is `True` and `active` is `False` (the `command.append("--frontmost")` branch runs `active=True` without `--allow-multiple`).  For `active=True`, `allow_multiple` is irrelevant (there is at most one frontmost window), so this is not a bug — but it is undocumented.
+**[low] `run_command` does not redirect screenshot-tool stdout/stderr, risking structured-output pollution**
+`capture_screenshot.py:465`
+`subprocess.run(args, check=True)` inherits the calling process's stdout and stderr file descriptors.
+Screenshot tools such as ImageMagick `import`, `spectacle`, and `gnome-screenshot` may emit
+diagnostic warnings or informational lines. Because `run_command` provides no redirection, these
+lines are written directly to the Python script's stdout — interleaved with the structured output
+(file paths or `"clipboard"`) that callers (AI agents, shell scripts) parse. For example,
+`import -window root output.png` may emit X11 connection warnings to stderr; some builds of
+`spectacle` write a status line to stdout before writing the file. An agent parsing the script's
+stdout for the saved path could be confused by extra, unexpected lines. The 2026-06-18 entry
+documented the same issue for the `clang` compilation step specifically; this finding extends it to
+the runtime screenshot-tool invocations.
+_Suggested fix:_ In `run_command`, pass `stderr=subprocess.PIPE` to capture tool stderr and include
+it in any `CalledProcessError` message (which also addresses the 2026-06-11 `CalledProcessError`
+finding). For stdout, pass `stdout=subprocess.DEVNULL` unless the tool is known to produce output
+needed by the caller — none of the currently used screenshot tools write meaningful data to stdout
+(they write to the output file path instead). This change fully isolates tool diagnostic output from
+the Python script's structured result lines.
 
-**[low] `_linux_window_is_viewable` uses `"iconic" not in proc.stdout.lower()` — fragile string match**
-`capture_screenshot.py:_linux_window_is_viewable`
-As noted in the 2026-06-15 entry.  Remains unresolved.  Carry-forward tracking note.
-
-**[medium] `Copy-Window` on Windows does not fall back to `CopyFromScreen` when `PrintWindow` returns `$false`**
-`scripts/capture_screenshot.ps1:Copy-Window`
-`if (-not $ok) { $bitmap.Dispose(); throw 'PrintWindow failed to capture the window' }`
-A `PrintWindow` failure (e.g., GPU/DWM-composited window that ignores the message)
-throws and aborts the entire capture.  The `Test-BitmapAllBlack` check that follows
-in `Capture-ToDestination` is never reached.  The user receives an exception rather
-than a warning and a potentially usable (non-black) screenshot.
-_Suggested fix:_ On `PrintWindow` failure, fall back to `Copy-Rectangle` on the same
-bounds, emit a warning to stderr, and continue.
+**[info] `_test_windows()` validates `"id"`, `"capturable"`, and `"state"` field types but not `"owner"` or `"title"`**
+`capture_screenshot.py:310–322`
+`_test_windows()` checks that `"id"` is an `int`, `"capturable"` is a `bool`, and `"state"` is a
+`str`, but applies no type validation to `"owner"` or `"title"`. Both fields are consumed in
+`resolve_macos_window_ids` via `str(window.get("owner", ""))` and `str(window.get("title", ""))`,
+so a non-string value (e.g., `{"owner": 42}`) silently coerces to `"42"` rather than triggering a
+validation error. This is inconsistent with the explicit checks on the other three fields and could
+mask a malformed test fixture where an integer was accidentally used where a string was intended.
+The risk is test-only; there is no production impact.
+_Suggested fix:_ Add `if "owner" in entry and not isinstance(entry["owner"], str): die(...)` and the
+equivalent for `"title"`, consistent with the existing validation pattern for the other fields.
 
 ---
 
 ### Data leaks
 
-No new findings.
+No new findings. All previously documented title-privacy invariants continue to hold in the reviewed
+code. The `ensure_private_directory` error-handling gap involves OS-level error strings (`ENOSPC`,
+`EROFS`) — not window titles. The `run_command` stdout/stderr concern involves tool diagnostics
+(X11 display strings, rendering status lines), not window title metadata retrieved from the OS.
+The relative-path PowerShell issue involves only the output directory path. No new code paths that
+could expose window titles were identified.
 
 ---
 
 ### UX
 
-**[info] `Capture-ToDestination` emits the black-bitmap warning to `[Console]::Error` with `$Label` (user's query) in the message**
-`scripts/capture_screenshot.ps1:Capture-ToDestination`
-`"warning: '$Label' rendered black via PrintWindow (GPU/Electron window); content may
-be unavailable without bringing it forward."` uses `$Label` (the sanitised user query).
-This is correct privacy-wise (not the window title), but the warning goes to stderr
-mixed with other error output.  An agent parsing stderr would need to distinguish this
-warning from fatal errors.  Adding a structured prefix (e.g., `warning:`) would help;
-the warning already starts with `"warning:"` so this is already partially addressed.
+**[low] README "Named window → clipboard" example works on macOS but crashes with an opaque error on Linux X11**
+`README.md:122–126`, `capture_screenshot.py:288–296, 499–502`
+The README presents "Screenshot the Figma window and copy it to my clipboard" as a working usage
+example. On macOS this works correctly. On Linux X11 with `xdotool` + ImageMagick `import` (the
+only currently supported named-window capture backend on X11), the 2026-06-10 high-severity bug
+applies: `plan_capture` returns commands containing `"{output}"` placeholders, but `execute_plan`'s
+clipboard branch (line 499) calls `run_command(command)` without the `output` argument, causing
+an immediate exit with "internal error: missing output path" (exit 64). The feature as documented
+is not functional on that platform. A user on a minimal, GNOME-free X11 desktop who follows this
+example will receive the opaque internal error with no hint that named-window clipboard capture is
+unsupported on their setup.
+_Suggested fix:_ Add a platform qualification to the README example noting that named-window
+clipboard capture is supported on macOS and Windows but not on Linux X11 at present. Alternatively,
+fix the underlying 2026-06-10 bug (return `CapturePlan(False, "unsupported_linux_x11_window_clipboard", …)`)
+and update the README once the fix is in place.
+
+**[info] `CONTRIBUTING.md` test-data schema omits the `capturable` and `state` fields**
+`CONTRIBUTING.md:77`, `capture_screenshot.py:_test_windows(), resolve_macos_window_ids()`
+The CONTRIBUTING.md table documents `CAPTURE_SCREENSHOT_TEST_WINDOWS` entries as having fields
+`{"id": int, "owner": str, "title": str}`. The actual implementation also handles `"capturable":
+bool` (defaults to `true`; set `false` to simulate a minimized or off-Space window) and `"state":
+str` (e.g., `"minimized"`, `"offscreen"`, `"unknown"`) used in `not_capturable_message`. Tests in
+`test_capture_screenshot.py` depend on both fields (lines 99, 126, 149, 164, 236). A contributor
+writing a new test for minimized-window behaviour using only CONTRIBUTING.md as a reference would
+not discover these fields. The 2026-06-17 info entry noted a different CONTRIBUTING.md inaccuracy
+(the `plan_capture` code snippet omitting the `XDG_SESSION_TYPE` fallback); this finding is a
+distinct, additional omission in the test-data documentation.
+_Suggested fix:_ Extend the CONTRIBUTING.md table entry to document the full schema:
+`{"id": int, "owner": str, "title": str, "capturable": bool (default true), "state": str (optional, e.g. "minimized" / "offscreen" / "unknown")}`.
 
 ---
 
@@ -963,63 +1240,120 @@ the warning already starts with `"warning:"` so this is already partially addres
 
 ### Security
 
-**[medium] `capture_screenshot.ps1` has no home-directory containment check for `-OutputRoot` (carry-forward, first reported 2026-06-08)**
-Status: **still unresolved** as of this review.  No new technical information beyond
-prior entries.
+**[low] `Copy-Rectangle` leaks GDI `$bitmap` if `Graphics::FromImage()` raises before the `try` block is entered**
+`capture_screenshot.ps1:238-246`
+The pattern is identical to the `Copy-Window` finding from 2026-06-18 but at a different function.
+`$bitmap` is allocated unconditionally on line 238, then `[Drawing.Graphics]::FromImage($bitmap)` is
+called. If `FromImage` raises (e.g., GDI handle exhaustion on a resource-constrained host), the `try`
+block is never entered, so neither `$graphics.Dispose()` (in the inner `finally`) nor any cleanup for
+`$bitmap` runs. The caller (`Capture-ToDestination`) has a `try/finally { $bitmap.Dispose() }` guard,
+but because `Copy-Rectangle` throws rather than returning, the caller's `$bitmap` variable is never
+assigned, leaving the allocated `Bitmap` object unreachable for the duration of the process.
+_Suggested fix:_ Wrap the `$bitmap` allocation and `FromImage` call in a `try` block with a `catch`
+that disposes `$bitmap` and re-throws, or restructure so `$bitmap` is disposed inside the same
+`finally` as `$graphics`:
+```powershell
+$bitmap = [Drawing.Bitmap]::new($Bounds.Width, $Bounds.Height)
+try {
+    $graphics = [Drawing.Graphics]::FromImage($bitmap)
+    try { $graphics.CopyFromScreen(...); return $bitmap }
+    finally { $graphics.Dispose() }
+} catch { $bitmap.Dispose(); throw }
+```
 
-**[low] `find_macos_window_id.m` compiled binary temp-dir metadata leak (carry-forward, first reported 2026-06-17)**
-Status: **still unresolved**.
+**[low] `CopyFromScreen` in `Copy-Rectangle` can throw `Win32Exception` on display-unavailable sessions with no structured handling**
+`capture_screenshot.ps1:241`
+`$graphics.CopyFromScreen(...)` calls the GDI `BitBlt` API internally. In environments where no
+physical or virtual display frame-buffer is accessible — Remote Desktop sessions with GPU
+acceleration disabled, Citrix ICA sessions, Windows Server Core without a display driver, or
+headless CI runners — `CopyFromScreen` raises `System.ComponentModel.Win32Exception`. Because
+`$ErrorActionPreference = 'Stop'` is set globally, this becomes a terminating error and the script
+exits with code 1 and a raw .NET exception trace. There is no equivalent to the `Test-BitmapAllBlack`
+advisory path that exists for `PrintWindow`. The `--target fullscreen` and `--target active` code
+paths both route through `Copy-Rectangle` (the former always, the latter as the `Copy-Window` screen
+fallback), so both are affected.
+_Suggested fix:_ Wrap the `CopyFromScreen` call in `try/catch [System.ComponentModel.Win32Exception]`
+and emit `[Console]::Error.WriteLine("window_not_capturable: screen buffer is unavailable in this
+session — try running in a session with an active display"); exit 75` to give a structured, actionable
+error code matching the documented exit table.
 
-**[medium] `test_windows_delegates_to_powershell` shell injection in test script (carry-forward, first reported 2026-06-18)**
-`tests/test_capture_screenshot.py:test_windows_delegates_to_powershell`
-The fake PowerShell script embeds `args_file` (a `Path`) directly in shell script
-source.  If the temp path contained shell metacharacters, the embedded path would cause
-unintended shell execution.  Remains unresolved.
-_Suggested fix:_ Use `shlex.quote(str(args_file))` or pass the path via an environment
-variable.
+**[info] `_validate_integer_ids` uses `str.isdigit()` rather than `str.isdecimal()`, accepting non-decimal Unicode digit characters**
+`capture_screenshot.py:83`
+```python
+if not id_str.isdigit():
+```
+Python's `str.isdigit()` returns `True` for superscript and subscript digits (`²`, `³`, `⁴` …),
+Roman numeral digits, and other Unicode characters classified as "digit" but not "decimal" (e.g.,
+`"²".isdigit()` is `True`, `"²".isdecimal()` is `False`). In practice the macOS
+`CGWindowListCopyWindowInfo` helper and xdotool exclusively emit ASCII decimal strings, so this
+cannot be exploited; but the validation is technically wider than intended and would silently accept
+a non-decimal digit string that would then fail at the OS API call site (e.g., `screencapture -l
+²`). Using `str.isdecimal()` or `re.fullmatch(r'[0-9]+', id_str)` would express the intended
+constraint precisely.
+_Suggested fix:_ Replace `id_str.isdigit()` with `id_str.isdecimal()` (or an explicit ASCII-digit
+regex) so the guard matches exactly the set of strings that are valid decimal window IDs.
 
-**[info] `CAPTURE_SCREENSHOT_TEST_PLATFORM` and `CAPTURE_SCREENSHOT_TEST_WINDOWS` are production env-var hooks with no documented way to disable them**
-`capture_screenshot.py:_test_platform`, `_test_windows`
-Both test hooks are checked unconditionally in `main` / `resolve_macos_with_helper`.
-There is no `CAPTURE_SCREENSHOT_DISABLE_TEST_HOOKS=1` escape hatch.  In a CI/CD
-pipeline that sets these variables for one job and leaks them into a child process
-running the real capture script, behaviour would be silently altered.
+**[info] Test-override environment variables have no production-mode guard**
+`capture_screenshot.py:302-322` (`_test_platform`, `_test_windows`)
+`CAPTURE_SCREENSHOT_TEST_PLATFORM` and `CAPTURE_SCREENSHOT_TEST_WINDOWS` are read
+unconditionally from the environment with no check that the process is running in a test context.
+If either variable is inadvertently set in a production or agent-pipeline environment — for example,
+leaked from a CI step that did not clean up its exported variables, or set by a co-process sharing
+the same environment — the script silently redirects platform detection or window resolution to
+mock values without any warning. A consumer (human or agent) receives a plausible success but the
+capture was performed against synthetic data. There is no `--no-test-overrides` flag or similar
+explicit opt-in to test mode.
+_Suggested fix:_ Add a note to the module docstring and to SKILL.md warning that these variables
+must never be set in production. Alternatively, gate their use on an explicit `--test-mode` flag
+or on the presence of both variables together, so a single stray variable cannot silently alter
+behaviour.
 
 ---
 
 ### Bugs & regressions
 
-**[medium] `Copy-Window` `PrintWindow` failure does not fall back to `CopyFromScreen` (carry-forward, first reported 2026-06-19)**
-Status: **still unresolved**.
-
-**[low] `_linux_window_is_viewable` uses fragile `"iconic"` substring match (carry-forward, first reported 2026-06-15)**
-Status: **still unresolved**.
-
-**[medium] `plan_capture` for Linux `target=active` has no `xdotool`+`import` fallback (carry-forward, first reported 2026-06-18)**
-Status: **still unresolved**.
+**[low] Linux `--target window --allow-multiple-matches` in dry-run does not exercise the xdotool + xprop label-deduplication chain in any integration test**
+`tests/test_capture_screenshot.py`
+`test_prepare_output_paths_suffixes_duplicate_labels_in_one_request` (line 53) verifies filename
+deduplication in isolation, and `test_linux_viewable_window_passes_through` (line 198) exercises
+`resolve_linux_named_window` with a fake xdotool. However, no integration test wires these together:
+no test runs the full script subprocess with `CAPTURE_SCREENSHOT_TEST_PLATFORM=Linux`, fake xdotool
+returning two IDs, fake xprop marking both viewable, `--allow-multiple-matches`, and
+`--destination desktop --dry-run`, then asserts that two distinct output paths are printed on
+separate lines. A regression in the `labels.extend([sanitize_label(query)] * len(resolution.ids))`
+→ `prepare_output_paths(labels)` → `reserved` set deduplication chain would not be caught. The
+analogous macOS gap was documented in 2026-06-15 (info); this finding is the distinct Linux path.
+_Suggested fix:_ Add an integration test using `_write_fake_tool` (following the pattern of
+`test_linux_viewable_window_passes_through`) for both xdotool (printing two IDs) and xprop
+(printing `window state: Normal` for each), then run the script subprocess with
+`--target window --allow-multiple-matches --destination desktop --dry-run --query Calculator`
+and assert two distinct `.png` paths are printed.
 
 ---
 
 ### Data leaks
 
-No new findings.
+No new findings. The `CopyFromScreen` exception path (above) surfaces only a .NET Win32Exception
+message containing an OS error code and a static description — no window title metadata. The
+`Copy-Rectangle` GDI leak involves only pixel data in kernel-managed GDI memory, inaccessible to
+other processes. The `.isdigit()` widening and env-var guard gap involve no user data exposure.
+All previously documented title-privacy invariants continue to hold across all three platform paths.
 
 ---
 
 ### UX
 
-**[info] `install.sh` has no `--dry-run` or `--help` flag**
-`install.sh`
-The installer unconditionally clones the repository into each detected skills
-directory.  There is no way to preview what would be installed without running the
-script.  A `--dry-run` flag and a `--help` message would improve usability.
-
-**[info] `screencapture` on macOS does not emit a structured error when the target window disappears between resolution and capture**
-`capture_screenshot.py:execute_plan` (Darwin path)
-Between `resolve_macos_with_helper` (which queries the window list) and the actual
-`screencapture -l {window_id}` call, the target window may close.  `screencapture`
-exits with a non-zero code, which `subprocess.run(args, check=True)` raises as
-`CalledProcessError` — an unhandled exception rather than a clean `die()` message.
+**[low] `CopyFromScreen` display-unavailable failure gives no actionable guidance (UX dimension of the Security finding above)**
+`capture_screenshot.ps1:241`
+A user running `--target fullscreen` or `--target active` in a Remote Desktop, Citrix, or headless
+Windows session receives exit code 1 and a multi-line .NET exception stack trace. The trace
+(`System.ComponentModel.Win32Exception: The handle is invalid`) gives no hint that the fix is to
+use a locally attached console session or to bring the session to the foreground. The `PrintWindow`
+path at least has `Test-BitmapAllBlack` that surfaces a user-readable warning; `CopyFromScreen` has
+no equivalent.
+_Suggested fix:_ Same as the Security entry above — catch `Win32Exception` around `CopyFromScreen`
+and emit a structured `window_not_capturable` message with display-session guidance before exiting
+with code 75.
 
 ---
 
@@ -1027,76 +1361,120 @@ exits with a non-zero code, which `subprocess.run(args, check=True)` raises as
 
 ### Security
 
-**[medium] `capture_screenshot.ps1` `-OutputRoot` path containment gap (carry-forward)**
-Status: **still unresolved**.
-
-**[low] `find_macos_window_id.m` temp-dir name visible in `/tmp` (carry-forward)**
-Status: **still unresolved**.
-
-**[medium] Test shell-injection in `test_windows_delegates_to_powershell` (carry-forward)**
-Status: **still unresolved**.
-
-**[low] `resolve_macos_with_helper`: uncaught `CalledProcessError` from clang compilation reveals install path**
-`capture_screenshot.py:resolve_macos_with_helper`
-This was noted in passing in the 2026-06-09 entry.  On this review pass, verifying the
-current `main` branch: `subprocess.run([clang, …], check=True)` is still not wrapped
-in a `try/except`.  A clang failure (e.g., Xcode CLT update removed a framework)
-produces a Python traceback including the full path to `find_macos_window_id.m` and
-the compile command on stderr.  The path reveals the skill installation directory.
-_Suggested fix:_ Wrap in `try/except subprocess.CalledProcessError` and call
-`die("macOS window helper failed to compile; ensure Xcode Command Line Tools are installed", EXIT_UNAVAILABLE)`.
+**[low] `install.sh` TOCTOU between existence checks and `git clone` in `clone_if_missing`**
+`install.sh:15–29`
+The three sequential existence guards (`[ -L "$dest" ]`, `[ -d "$dest" ]`, `[ -e "$dest" ]`) and
+the subsequent `git clone "$REPO" "$dest"` are not atomic. On a shared machine, a local attacker
+with write access to the parent skills directory (`$HOME/.claude/skills/`, etc.) could place a
+symlink at `$dest` in the window between `[ -e "$dest" ]` returning false and `git clone`
+executing. `git clone` follows the symlink and writes repository files into the symlink target
+(an attacker-chosen directory) rather than the intended skills location. Exploitation requires
+precise timing but no elevated privileges. This is the install-time analogue of the 2026-06-08
+`ensure_private_directory` TOCTOU and the 2026-06-13 `os.replace` symlink findings.
+_Suggested fix:_ After a successful `git clone`, add a post-clone symlink guard:
+`[ -L "$dest" ] && { echo "error: $dest is a symlink after clone — aborting"; exit 1; }`.
+Alternatively, note the residual race in a comment for shared-machine deployments.
 
 ---
 
 ### Bugs & regressions
 
-**[medium] `Copy-Window` failure does not fall back (carry-forward, first reported 2026-06-19)**
-Status: **still unresolved**.
+**[medium] `_linux_window_is_viewable` xprop path misclassifies windows on other virtual desktops as capturable**
+`capture_screenshot.py:374–383`
+`xprop -id N WM_STATE` reports `Window state: Normal` for windows that reside on other EWMH
+virtual desktops in common window managers (Openbox, XFWM, Mutter, i3). Such windows are not
+minimized (ICCCM Iconic state), so the check `"iconic" not in proc.stdout.lower()` returns
+`True` (capturable). Yet these windows are unmapped from the current display; ImageMagick
+`import -window <id>` called on them typically returns a black or stale cached image. The
+`xwininfo` fallback (lines 380–383) correctly uses `Map State: IsViewable`, which is `False`
+for unmapped off-desktop windows. However, because `xprop` is checked first (line 374:
+`if xprop:`) and its non-None result is returned immediately without falling through to
+`xwininfo`, systems where xprop is available silently receive an incorrect capture instead of
+a `window_not_capturable` error — even when xwininfo is also installed and would have
+identified the window as non-viewable.
+_Suggested fix:_ After the xprop WM_STATE check returns a "Normal" (non-Iconic) result, also
+query `_NET_WM_STATE` via `xprop -id N _NET_WM_STATE` and return `False` if `_NET_WM_STATE_HIDDEN`
+is present. Alternatively, always fall through to xwininfo as a cross-check whenever xprop
+returns "Normal", rather than short-circuiting. Add a test with a fake xprop emitting
+`window state: Normal` and a fake xwininfo emitting `Map State: IsUnMapped` to confirm the
+combined path returns `False`.
 
-**[low] Fragile `"iconic"` substring match in `_linux_window_is_viewable` (carry-forward)**
-Status: **still unresolved**.
+**[low] `prepare_output_paths` creates the timestamped request directory before `plan_capture` runs, leaving empty directories on failed fullscreen and active-window captures**
+`capture_screenshot.py:623–633` (`main()`), `capture_screenshot.py:420–434` (`prepare_output_paths`)
+In `main()`, `prepare_output_paths(..., create=not args.dry_run)` is called before
+`plan_capture()`. For `--target fullscreen` (label `["screen"]` set at line 604) and for
+`--target active` on Linux where resolution succeeds but the tool check in `plan_capture`
+subsequently fails (e.g., no gnome-screenshot on a headless session), the request directory
+(`~/Desktop/screenshots/MM_DD_YYYY_HH_MM_SS/`) is created and secured on disk before the
+missing-tool error is returned. `execute_plan` then calls `die()`, leaving behind an empty
+timestamped directory. On systems where screenshot tools are absent or transiently unavailable,
+repeated failed attempts accumulate empty directories with no indication that cleanup is needed.
+For `--target window` the window resolution runs first and exits early on failure, so that
+path is less exposed; the gap mainly affects fullscreen captures on tool-absent systems.
+_Suggested fix:_ Move the `prepare_output_paths` call to after `plan_capture` returns a
+successful plan (i.e., `plan.ok` is True), so directories are only created when a capture is
+certain to proceed. Alternatively, clean up the request directory in `execute_plan`'s error
+path: if `not plan.ok` and the request dir was just created and is empty, remove it before
+calling `die()`.
 
-**[medium] Linux `active` target missing `xdotool`+`import` fallback (carry-forward)**
-Status: **still unresolved**.
-
-**[medium] `screencapture` failure when window closes between resolution and capture produces unhandled `CalledProcessError` (carry-forward)**
-Status: **still unresolved**.
-
-**[low] `find_macos_window_id.m` silently uses the last positional argument when multiple are supplied**
-`scripts/find_macos_window_id.m:42–52`
-In the argument-parsing loop, the `else` branch unconditionally overwrites `query_arg`
-with the current `argv[i]`.  Passing two positional arguments silently discards the
-first.  Since the Python caller controls the arguments, this cannot be exploited from
-outside, but it makes the binary fragile to future refactors.
-_Suggested fix:_ Detect multiple positional arguments and print a usage error with
-`return 64`.
+**[low] `Capture-ToDestination` `finally { $bitmap.Dispose() }` references an unset `$bitmap` when `Copy-Window` or `Copy-Rectangle` throws before returning**
+`capture_screenshot.ps1:295–349`
+`$bitmap` is assigned by calling `Copy-Window` or `Copy-Rectangle` (lines 309 and 314). If
+either function throws before returning — for example, from `[Drawing.Graphics]::FromImage` or
+`[Drawing.Bitmap]::new` as documented in the 2026-06-18 (`Copy-Window`) and 2026-06-20
+(`Copy-Rectangle`) GDI-leak findings — `$bitmap` is never assigned in `Capture-ToDestination`'s
+scope. The outer `try { ... } finally { $bitmap.Dispose() }` block then executes its `finally`
+clause with `$bitmap` unset. Under `Set-StrictMode -Version Latest`, referencing an unset
+variable throws "Variable is not set", which becomes a second terminating error under
+`$ErrorActionPreference = 'Stop'`. Depending on PowerShell version, this secondary error can
+mask the original GDI exception in the error record, making the root cause harder to diagnose
+in practice. The 2026-06-18 and 2026-06-20 entries documented GDI leaks inside the helper
+functions themselves; this finding is the companion issue at the caller.
+_Suggested fix:_ Initialize `$bitmap = $null` before the `Copy-Window`/`Copy-Rectangle`
+branch and guard the `finally` disposal: `if ($null -ne $bitmap) { $bitmap.Dispose() }`.
+This prevents the secondary unset-variable error and makes the cleanup logic explicit regardless
+of which allocation path was taken.
 
 ---
 
 ### Data leaks
 
-No new findings.  Window titles remain excluded from all output.  The `query` string
-passed to `_escape_ere` and then to xdotool is user-supplied text, not a window title,
-and is not echoed in normal output.
+No new findings. The `_linux_window_is_viewable` misclassification (above) can cause a silent
+capture of an off-desktop window's pixel data, but the script output and filename derive only
+from the user's sanitized query — no actual window title is exposed through any output path.
+The install.sh TOCTOU involves file system layout only; no screenshot content or window title
+metadata is at risk. The `$bitmap` unset-variable issue involves only GDI pixel memory
+(inaccessible to other processes). All previously documented title-privacy invariants continue
+to hold across all three platform paths: error messages echo only user-supplied query text,
+`sanitize_label` strips URLs and non-alphanumeric content before embedding labels in paths,
+and the macOS helper never prints window titles to stdout or stderr.
 
 ---
 
 ### UX
 
-**[info] No machine-readable output format (carry-forward)**
-The line-oriented stdout format (path per line / "clipboard") is hard to parse when
-paths contain spaces.  `--output-format json` remains unimplemented.
+**[low] Empty timestamped directories accumulate silently on failed fullscreen captures**
+`capture_screenshot.py:623–633`, `capture_screenshot.py:420–434`
+(UX dimension of the Bugs entry above.) A user on a system without a supported screenshot tool
+who repeatedly attempts `--target fullscreen --destination desktop` receives a
+`missing_dependency_fullscreen` error each time, but also silently accumulates a new empty
+`~/Desktop/screenshots/MM_DD_YYYY_HH_MM_SS/` directory for every attempt. Nothing in the
+error output indicates these stale directories were created or that they need to be cleaned up.
+Over many retries (e.g., while installing the missing tool), the screenshots folder fills with
+empty timestamped directories.
+_Suggested fix:_ Same as the Bugs entry — defer directory creation to after plan validation, or
+remove empty request directories in the error exit path.
 
-**[info] `gnome-screenshot -w` 1-second implicit delay (carry-forward, first reported 2026-06-11)**
-Status: **still unresolved**.
-
-**[medium] `plan_capture` for Linux active-window silently succeeds without `gnome-screenshot`, then `execute_plan` fails when the plan is `not ok` — but the error message cites "missing_dependency_active_window" without naming the missing tool**
-`capture_screenshot.py:plan_capture` (Linux active branch)
-`return CapturePlan(False, "missing_dependency_active_window", "No supported Linux active-window screenshot tool was found.")`
-The message names no specific tool.  A user without `gnome-screenshot` might not know
-which package to install.
-_Suggested fix:_ List the missing tool(s) explicitly: "No supported Linux active-window
-screenshot tool was found. Install gnome-screenshot (GNOME) or use xdotool+import (X11)."
+**[info] `_linux_window_is_viewable` misclassification gives no warning; user receives a black or stale PNG with exit 0**
+`capture_screenshot.py:374–383`
+(UX dimension of the medium Bug entry above.) When a window on another virtual desktop is
+misclassified as capturable and `import -window <id>` is used, the tool exits 0 and writes a
+black or stale-content PNG to the output path. The Python script reports success (prints the
+path and exits 0). The user has no indication that the captured window was not on the current
+desktop and that the image content may be incorrect.
+_Suggested fix:_ Same as the Bug entry — cross-check with `xwininfo` Map State or
+`_NET_WM_STATE_HIDDEN` before classifying a window as capturable, so a
+`window_not_capturable` error is returned rather than a silent incorrect capture.
 
 ---
 
@@ -1104,84 +1482,157 @@ screenshot tool was found. Install gnome-screenshot (GNOME) or use xdotool+impor
 
 ### Security
 
-**[medium] `capture_screenshot.ps1` `-OutputRoot` containment gap (carry-forward)**
-`scripts/capture_screenshot.ps1:6`
-Status: **still unresolved** as of the current `main` branch.
+**[low] macOS fullscreen `screencapture` omits `-x`, playing an audible shutter sound; inconsistent with silent named-window captures**
+`capture_screenshot.py:220`
+The fullscreen macOS plan is `(screencapture, "{output}")` — no `-x` flag. The named-window
+plan (`plan_capture` lines 228–230) and the active-window variant both use
+`(screencapture, "-x", "-l", str(window_id), "{output}")`, explicitly suppressing the shutter
+sound. On a macOS system where the screenshot sound is enabled (the default), every fullscreen
+capture produces an audible click, while named-window and active-window captures are silent. In
+an agent-automated pipeline this is unexpected and potentially disruptive. It also reveals the
+capture mode to a nearby observer via audio: the presence or absence of the click discloses
+whether a fullscreen or a targeted capture was taken — a minor but non-obvious information leak
+about capture intent.
+_Suggested fix:_ Add `-x` to the fullscreen command: `(screencapture, "-x", "{output}")` and,
+for the clipboard variant, `(screencapture, "-x", "-c")`. If retaining the sound for
+transparency is a deliberate design choice, apply it consistently to all capture modes and
+document the rationale; in its current asymmetric form it creates divergent UX with no clear
+intent.
 
-**[low] Windows `Protect-Directory` TOCTOU between `New-Item` and `Set-Acl` (carry-forward, first reported 2026-06-10)**
-`scripts/capture_screenshot.ps1:Protect-Directory`
-The 2026-06-10 finding — directory created by `New-Item` with inherited ACLs, then
-secured by `Set-Acl` a moment later — remains unresolved.
-_Suggested fix:_ Use `[System.IO.Directory]::CreateDirectory(path, directorySecurity)`
-to apply the ACL atomically at creation time.
+**[low] `Protect-Directory` ACL failure on an externally-owned `$OutputRoot` produces an unstructured terminating error**
+`capture_screenshot.ps1:97–112`
+`Get-Acl` / `Set-Acl` on a directory owned by a different Windows account raises
+`System.UnauthorizedAccessException`. Under `$ErrorActionPreference = 'Stop'` this terminates
+the script with a raw .NET exception trace and exit code 1 instead of a structured
+`[Console]::Error.WriteLine` / `exit 74`. The scenario is reachable whenever
+`capture_screenshot.ps1` is invoked directly (without the Python orchestrator) and
+`$OutputRoot` points to a path the caller does not own — more plausible given that the PS
+script applies no home-containment check of its own (noted in the 2026-06-08 entry). Combined
+with the 2026-06-16 finding that `New-Item` uses `-Path` rather than `-LiteralPath`, a
+wildcard-containing `$OutputRoot` could silently create a directory at an unintended location
+where the ACL operation then fails.
+_Suggested fix:_ Wrap the `Get-Acl` / `Set-Acl` pair in
+`try/catch [System.UnauthorizedAccessException]` and emit
+`[Console]::Error.WriteLine("screenshots_folder_error: cannot secure permissions on $Path — use a path you own exclusively"); exit 74`.
 
-**[low] Clipboard pipeline temp file created in world-searchable `/tmp` (carry-forward, first reported 2026-06-23 — see below)**
-Noted in the 2026-06-23 entry below.
-
-**[low] `resolve_macos_with_helper`: uncaught `CalledProcessError` from clang (carry-forward, first reported 2026-06-21)**
-`capture_screenshot.py:resolve_macos_with_helper`
-Status: **still unresolved**.
-
-**[medium] Test-code shell injection in `test_windows_delegates_to_powershell` (carry-forward)**
-`tests/test_capture_screenshot.py`
-Status: **still unresolved**.
+**[info] `Sanitize-Label` in PowerShell lacks the `or 'capture'` fallback in the truncation branch**
+`capture_screenshot.ps1:76–79`
+Python's `sanitize_label` (line 74) uses `label[:80].strip("-") or "capture"` — the `or "capture"`
+ensures a non-empty return even if all 80 characters are hyphens. PowerShell's `Sanitize-Label`
+guards the pre-truncation empty case with `IsNullOrWhiteSpace` and returns `'capture'`, but the
+`>80` branch (`$label.Substring(0, 80).Trim('-')`) has no subsequent empty-guard. Under current
+sanitization rules — non-alphanumeric characters collapse to a single hyphen, so the label must
+contain alphanumeric content to reach 80 characters — an empty result after truncation is
+unreachable. The asymmetry is a latent inconsistency: if the regex rules change (for example, to
+strip more characters), the PowerShell truncation branch could silently return an empty string
+where Python would return `'capture'`.
+_Suggested fix:_ `$t = $label.Substring(0, 80).Trim('-'); if ([string]::IsNullOrWhiteSpace($t)) { return 'capture' }; return $t`, matching the Python semantics exactly.
 
 ---
 
 ### Bugs & regressions
 
-**[medium] `Copy-Window` `PrintWindow` failure has no fallback (carry-forward, first reported 2026-06-19)**
-Status: **still unresolved**.
+**[medium] `execute_plan` does not validate that the screenshot tool wrote non-empty data before reporting success**
+`capture_screenshot.py:507–519`
+After `run_command(command, output=temp_output)` returns without raising (exit 0), the code
+renames the temp PNG to the final output path and prints the path to stdout — signalling success.
+No check is made that the tool actually wrote any bytes. Known cases where a screenshot tool
+exits 0 but writes an empty or degenerate file include:
+- `screencapture` on certain macOS configurations exits 0 and writes 0 bytes when Screen
+  Recording permission is denied. The 2026-06-16 entry documented the `window-helper`
+  path returning "no_matching_window" instead of a permission diagnostic; the present finding is
+  the downstream capture step, which receives a valid-looking command but cannot obtain pixel data.
+- `grim` is documented to exit 0 with a zero-byte file when the Wayland compositor's frame
+  callback times out silently.
+- `import -window root` exits 0 with a 1×1 white PNG on some headless X11 display configurations.
+In all three cases the caller — agent or user script — receives a file path on stdout and exit 0,
+but the saved PNG is unusable with no error or warning.
+_Suggested fix:_ Immediately after `run_command` returns, assert
+`temp_output.stat().st_size > 0`; if the file is empty, call
+`die("capture tool wrote no data — check screen recording permissions and display availability", EXIT_UNAVAILABLE)`.
+Optionally verify the first 4 bytes match the PNG magic number (`b'\x89PNG'`) to catch
+non-empty but corrupt output.
 
-**[low] `_linux_window_is_viewable` fragile `"iconic"` substring match (carry-forward)**
-Status: **still unresolved**.
+**[low] `install.sh` appends label to `DETECTED` before the skip-guards run, producing a misleading "Already installed" summary when the install was skipped**
+`install.sh:11, 14–29`
+`clone_if_missing` adds `$label` to `DETECTED` on line 11 — before the symlink guard (line 14),
+the existing-directory guard (line 19), and the non-directory guard (line 23). If any guard
+triggers a skip-and-return, the label remains in `DETECTED` with nothing in `INSTALLED`. At the
+end of the script (lines 55–66), the condition `${#INSTALLED[@]} -gt 0` is false and
+`${#DETECTED[@]} -gt 0` is true, so the summary prints
+`"Already installed for: Claude Code — nothing to do."` — a false-success message that
+directly contradicts any skip-warning the user saw moments earlier. The most impactful case is
+the symlink skip: the user sees `"warning: $dest is a symlink — skipping Claude Code"` and then
+`"Already installed for: Claude Code — nothing to do."`, which suggests the skill is functional
+when in fact it was not installed.
+_Suggested fix:_ Move `DETECTED+=("$label")` to after the skip guards — only add the label when
+the destination is a valid real directory (either pre-existing or newly cloned). Introduce a
+`SKIPPED` array for symlink/non-dir cases and include it in the final summary so the outcome is
+unambiguous.
 
-**[medium] Linux `active`-target missing `xdotool`+`import` fallback (carry-forward)**
-Status: **still unresolved**.
-
-**[medium] Unhandled `CalledProcessError` on `screencapture` failure (carry-forward)**
-Status: **still unresolved**.
-
-**[low] `find_macos_window_id.m` silently discards first positional arg when multiple supplied (carry-forward)**
-Status: **still unresolved**.
-
-**[medium] Windows dry-run with `--allow-multiple-matches` produces duplicate output paths**
-`scripts/capture_screenshot.ps1` (`New-CapturePath` called from `Capture-ToDestination`)
-In dry-run mode, `$script:RequestFolder` is set to a path that does not exist on disk
-(`Get-RequestFolderPath` instead of `New-RequestFolder`).  `New-CapturePath` checks
-`Test-Path -LiteralPath $candidate`, which returns `$false` for every candidate
-because the folder doesn't exist.  Multiple windows with the same label (e.g., three
-Chrome windows matched by `--allow-multiple-matches`) each return `chrome.png`, causing
-duplicate output paths with no uniqueness guarantee.  The Python side avoids this via
-an in-memory `reserved` set in `unique_capture_path`.
-_Suggested fix:_ Maintain a `$script:dryRunReserved` `HashSet[string]` and extend
-`New-CapturePath` to skip candidates already in the set, matching Python semantics.
+**[low] 2026-06-13 medium finding — `--query` silently discarded with non-window targets — has not been fixed or regression-tested**
+`capture_screenshot.py:main()` (~lines 591–596), `tests/test_capture_screenshot.py`
+The 2026-06-13 entry identified that `--query` values are silently ignored when
+`--target fullscreen` or `--target active` is used. The suggested fix was to add an early guard:
+```python
+if args.query and args.target != "window":
+    die(f"--query is only valid with --target window (got --target {args.target})", EXIT_USAGE)
+```
+and a corresponding regression test. As of today neither the guard nor the test has been added.
+The silent-discard behaviour — which can cause the user to believe their query was respected
+while a broader fullscreen capture proceeded — remains present in `main()`. Given the
+privacy-first design goal ("never fall back from `window` or `active` to `fullscreen` without
+separate approval"), a user who mistakenly passes `--query Safari --target fullscreen` receives
+no warning that their query was ignored.
+_Suggested fix:_ Implement the guard and test as described in the 2026-06-13 entry. This is a
+carry-over tracking item.
 
 ---
 
 ### Data leaks
 
-No new findings.  All output paths use sanitised query text; window titles are not
-exposed on any platform.
+No new findings. The empty-file finding above concerns pixel data absence rather than metadata
+leakage — an empty PNG contains no window title or content to expose. The `Protect-Directory`
+ACL exception message includes only the directory path (user-supplied `$OutputRoot`), not any
+window title. The `install.sh` DETECTED-label issue involves agent product names only. All
+previously documented title-privacy invariants continue to hold across all three platform paths:
+error messages echo only user-supplied query text (never real window titles from the OS),
+`sanitize_label` strips URLs and non-alphanumeric content before embedding labels in paths, and
+the macOS C helper never prints window title strings to stdout or stderr.
 
 ---
 
 ### UX
 
-**[info] `Test-BitmapAllBlack` O(samples) `GetPixel` performance (carry-forward, first reported 2026-06-10)**
-Status: **still unresolved**.
+**[low] `install.sh` symlink-skip warning is immediately contradicted by the final "Already installed" summary**
+`install.sh:14–17, 55–66`
+(UX dimension of the Bugs entry above.) A user with `~/.claude/skills/capture-screenshot`
+symlinked sees:
+```
+warning: /home/user/.claude/skills/capture-screenshot is a symlink — skipping Claude Code
+...
+Already installed for: Claude Code — nothing to do.
+```
+The final line directly contradicts the warning. A user glancing at the summary line would
+dismiss the symlink concern and assume everything is working, when in fact the skill may be
+pointing at a stale or missing target and failing silently at runtime.
+_Suggested fix:_ Same as the Bugs entry — track skipped entries in a `SKIPPED` array, show them
+separately in the summary (e.g., `"Skipped (symlink): Claude Code"`), and omit skipped labels
+from the "Already installed" or "Done" messages.
 
-**[info] `--query` silently discarded with non-window targets (carry-forward, first reported 2026-06-13)**
-Status: **still unresolved**.
+**[info] `CONTRIBUTING.md` stale line-number reference for the `detect_tools` call**
+`CONTRIBUTING.md:29`
+The contributing guide says: "add the tool name to the `detect_tools(...)` call in `main()` (around
+line 491)". In the current source the `detect_tools(...)` call sits around line 606. The referenced
+line 491 now falls in the middle of `plan_capture`, a different function entirely. A new
+contributor following this reference will be inspecting the wrong code section.
+_Suggested fix:_ Replace the specific line number with a context description: "find the
+`detect_tools(...)` call near the bottom of `main()`, just before the `plan_capture(...)` call."
 
-**[info] No machine-readable JSON output mode (carry-forward)**
-Status: **still unresolved**.
-
-**[info] `plan_capture` active-window error message doesn't name missing tools (carry-forward)**
-Status: **still unresolved**.
-
----
-
+**[info] Command/output path count mismatch is detected at execution time, not at plan-construction time**
+`capture_screenshot.py:505–507`
+The guard `if len(plan.commands) != len(output_paths): die("internal error: command/output mismatch", EXIT_USAGE)` runs inside `execute_plan`, after directories have been created and output paths allocated by `prepare_output_paths`. A mismatch — which would be a programming error in `plan_capture` — is therefore only discovered at the moment of execution, not when the plan is validated. The 2026-06-12 entry flagged the fragile `len==2` dispatch heuristic; this note extends it to the general observation that no structural validation of the plan is performed between `plan_capture` returning and `execute_plan` running. On a failed plan (`plan.ok == False`) this is immaterial since `execute_plan` dies immediately; the concern is valid plans where the command and output counts are coherent but diverge after a future refactor.
+_Suggested fix:_ Assert `len(plan.commands) == len(output_paths)` immediately after `prepare_output_paths` returns (in `main()`), before calling `execute_plan`. This surfaces the invariant at the right abstraction level and keeps `execute_plan`'s guard as a belt-and-suspenders runtime check rather than the sole detection point.
 ## 2026-06-23
 
 ### Security

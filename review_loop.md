@@ -1633,6 +1633,127 @@ _Suggested fix:_ Replace the specific line number with a context description: "f
 `capture_screenshot.py:505–507`
 The guard `if len(plan.commands) != len(output_paths): die("internal error: command/output mismatch", EXIT_USAGE)` runs inside `execute_plan`, after directories have been created and output paths allocated by `prepare_output_paths`. A mismatch — which would be a programming error in `plan_capture` — is therefore only discovered at the moment of execution, not when the plan is validated. The 2026-06-12 entry flagged the fragile `len==2` dispatch heuristic; this note extends it to the general observation that no structural validation of the plan is performed between `plan_capture` returning and `execute_plan` running. On a failed plan (`plan.ok == False`) this is immaterial since `execute_plan` dies immediately; the concern is valid plans where the command and output counts are coherent but diverge after a future refactor.
 _Suggested fix:_ Assert `len(plan.commands) == len(output_paths)` immediately after `prepare_output_paths` returns (in `main()`), before calling `execute_plan`. This surfaces the invariant at the right abstraction level and keeps `execute_plan`'s guard as a belt-and-suspenders runtime check rather than the sole detection point.
+
+---
+
+## 2026-06-25
+
+### Security
+
+**[medium] PowerShell parameter injection via `--query` values beginning with `-`**
+`capture_screenshot.py:539–540` (`_run_powershell_script`)
+`_run_powershell_script` constructs the PowerShell invocation by appending pairs of
+`"-Query", q` for each user-supplied query:
+```python
+for q in args.query:
+    cmd += ["-Query", q]
+```
+When a query value begins with `-` followed by a name that matches a declared `param()` entry in
+`capture_screenshot.ps1` — such as `"-DryRun"`, `"-AllowMultipleMatches"`, or `"-OutputRoot"` —
+PowerShell's `pwsh -File` parameter binder treats the token as a named switch rather than a value
+for `$Query`. Concretely:
+- `--query "-DryRun"` → PowerShell sees `-Query` with no value (PowerShell stops before `-DryRun`
+  since it recognises it as a switch) and then sets `$DryRun = $true`. The script prints
+  destination paths without capturing any pixels, exits 0, and Python's `main()` propagates the
+  zero exit code — the caller (agent or shell script) receives a success signal with no screenshot
+  having been taken.
+- `--query "-AllowMultipleMatches"` → `$Query = @()` and `$AllowMultipleMatches = $true`. Because
+  `$Query` is now empty, the `if ($Query.Count -eq 0)` guard fires and the script throws "window
+  target requires at least one query" — exit 1. No capture occurs, but the flag is activated
+  without the user opting in via Python's `--allow-multiple-matches`.
+- `--query "-OutputRoot"` → `$Query = @()` and the subsequent token (`str(args.output_root)`)
+  that Python placed after the loop as the real `-OutputRoot` value is consumed by PowerShell as the
+  value for this injected `-OutputRoot`, potentially binding the output root twice to the same
+  value — harmless but surprising. With additional careful crafting, a caller could cause the real
+  `-OutputRoot` argument to be parsed as a positional (and lost).
+An AI agent that passes a user-supplied window query verbatim to `--query` could be manipulated:
+a user who names their window (or fabricates a query like) `"-DryRun"` would cause a silent
+no-capture with exit 0 while the agent believes the screenshot succeeded. Python's consent and
+output-root validation run before `_run_powershell_script`, so those guards are unaffected, but the
+per-capture behaviour of the PowerShell script is subvertable.
+_Suggested fix:_ In `parse_args` or early in `main()`, reject any `--query` value that begins with
+`-`:
+```python
+for q in args.query:
+    if q.startswith('-'):
+        die(f"--query value must not begin with '-': {q!r}", EXIT_USAGE)
+```
+Add a corresponding test asserting `EXIT_USAGE` when `--query "-DryRun"` is passed. Alternatively,
+pass queries to PowerShell using a positional-array workaround that avoids `-Query` named binding,
+though this requires restructuring the PowerShell `param()` block.
+
+---
+
+### Bugs & regressions
+
+**[low] `resolve_macos_with_helper` exit-code-4 stderr token extraction relies on an undocumented implicit "last-line" convention**
+`capture_screenshot.py:359–364`
+When the macOS helper exits with code 4 (window present but not capturable), Python reads the
+reason token from the helper's stderr:
+```python
+if proc.returncode == 4:
+    token = ""
+    if proc.stderr and proc.stderr.strip():
+        token = proc.stderr.strip().splitlines()[-1].strip()
+    return ResolutionResult(False, "window_not_capturable", not_capturable_message(query, token))
+```
+The "last line" heuristic is an undocumented implicit contract between `find_macos_window_id.m`
+(which currently emits exactly one line: `"unknown\n"` for exit code 4) and the Python caller.
+If a future change to the C helper adds a diagnostic line before or after the reason token —
+for example, for new error subtypes or debug output — `splitlines()[-1]` would silently consume
+the wrong line. The result would be `not_capturable_message` receiving a garbled or empty `state`
+token, falling through to the generic "exists but cannot be captured" message rather than the
+more specific minimized/offscreen variant. No data is leaked (the token never appears in output),
+but the user-facing diagnostic message silently degrades.
+_Suggested fix:_ Document the one-line-on-stderr protocol explicitly in both the C source (a
+comment at the `fprintf(stderr, "unknown\n")` call site) and the Python function (a code comment
+at the `splitlines()[-1]` extraction). Alternatively, emit the reason token on a dedicated prefix
+(e.g., `"reason: unknown\n"`) and parse it with a regex in Python, making the contract explicit
+and immune to additional log lines from either side.
+
+**[high, carry-over] Linux X11 named-window clipboard capture crashes with "internal error: missing output path"**
+`capture_screenshot.py:288–296, 499–502`
+First reported 2026-06-10. `plan_capture` emits `{output}` placeholders for the X11 named-window
+clipboard path; `execute_plan`'s clipboard branch calls `run_command(command)` without `output=`,
+triggering the immediate `die()`. Unresolved as of main branch at this review.
+
+**[medium, carry-over] `--query` silently discarded when `--target` is `fullscreen` or `active`**
+`capture_screenshot.py:main()` (~lines 596–605)
+First reported 2026-06-13. No guard has been added; the silent-discard behaviour that contradicts
+the privacy-first design goal remains present. Unresolved as of main branch at this review.
+
+---
+
+### Data leaks
+
+No new findings. Window title isolation continues to hold on all three platforms. The PowerShell
+parameter-injection finding above (Security) can suppress a capture or activate flags, but the
+activation of `$DryRun` or `$AllowMultipleMatches` does not expose any window title metadata —
+the script produces no output or only synthesised path strings derived from the sanitized query.
+All previously documented title-privacy invariants continue to hold in the reviewed code.
+
+---
+
+### UX
+
+**[info] macOS exit-code-4 reason-token fragility degrades user-facing diagnostic messages silently**
+`capture_screenshot.py:359–364`
+(UX dimension of the Bugs finding above.) If the "last-line" implicit protocol between
+`find_macos_window_id.m` and `resolve_macos_with_helper` breaks due to an added diagnostic line
+in the helper, the user receives the generic `"'<query>' exists but cannot be captured (minimized
+or off-screen) — restore it and retry."` message instead of the more actionable `"'<query>' is
+minimized — restore it and retry."`. The degradation is silent: the script still exits with
+`EXIT_NOT_CAPTURABLE (75)`, so callers see the correct code, but the human-readable hint loses
+its specificity. The helper currently produces only the one-line output mandated by the protocol,
+so this is a latent rather than active UX regression.
+_Suggested fix:_ Same as the Bugs entry — formalise the protocol with a structured prefix or an
+explicit comment, so future contributors know the last-line constraint and preserve it.
+
+**[info] Carry-over: `--query` silently discarded with non-window targets (first reported 2026-06-13)**
+Still unresolved as of this review. No new technical information.
+
+**[info] Carry-over: PS1 has no `-OutputRoot` home-directory containment check when invoked directly (first reported 2026-06-23)**
+Still unresolved as of this review. No new technical information.
 ## 2026-06-23
 
 ### Security

@@ -1983,3 +1983,63 @@ Still unresolved as of this review. No new technical information.
 **[info] Carry-over: PS1 has no `-OutputRoot` home-directory containment check when invoked directly (first reported 2026-06-23)**
 Still unresolved as of this review. No new technical information.
 
+---
+
+## 2026-06-26
+
+### Security
+
+**[medium, carry-over] PowerShell parameter injection via `--query` values beginning with `-`**
+`capture_screenshot.py:539–540` (`_run_powershell_script`)
+First reported 2026-06-25. No fix has been applied: `parse_args` still imposes no constraint on query values that begin with `-`, and no regression test has been added. A query value such as `"-DryRun"` causes PowerShell's `pwsh -File` parameter binder to activate `$DryRun` silently, causing the script to print destination paths and exit 0 without capturing any pixels. The calling agent or shell script receives a success signal with no screenshot taken.
+_Suggested fix:_ Add a validation loop in `main()` (or `parse_args`) before `_run_powershell_script` is called:
+```python
+for q in args.query:
+    if q.startswith('-'):
+        die(f"--query value must not begin with '-': {q!r}", EXIT_USAGE)
+```
+Add a corresponding integration test asserting `EXIT_USAGE` when `--query "-DryRun"` is passed with `CAPTURE_SCREENSHOT_TEST_PLATFORM=Windows`.
+
+**[low] Compiled macOS helper source is not integrity-checked before execution**
+`capture_screenshot.py:325–365` (`resolve_macos_with_helper`), `scripts/find_macos_window_id.m`
+`resolve_macos_with_helper` compiles `find_macos_window_id.m` from the skill installation directory (`skill_dir / "scripts" / "find_macos_window_id.m"`) on every named-window or active-window capture. No checksum or signature of the source file is verified before compilation. If an attacker has write access to `~/.claude/skills/capture-screenshot/scripts/` — for example, via a misconfigured group-write bit on the skills directory, or via another process running as the same user — they can modify `find_macos_window_id.m`. The next capture invocation compiles and executes the modified source under the calling user's account. This requires same-user or root access and has no privilege-escalation potential on a single-user system, but is worth documenting as a trust-boundary concern. The 2026-06-24 entry noted the unhandled `CalledProcessError` from a failed compile; this finding is the pre-compilation attack surface.
+_Suggested fix:_ Add `chmod go-w scripts/find_macos_window_id.m` (and the scripts directory) to `install.sh` after `git clone`, ensuring only the owner can modify the source. Document the trust boundary in SKILL.md. Alternatively, compute a SHA-256 hash of the source at install time and verify it in `resolve_macos_with_helper` before invoking `clang`.
+
+---
+
+### Bugs & regressions
+
+**[high, carry-over] Linux X11 named-window clipboard crashes with "internal error: missing output path"**
+`capture_screenshot.py:288–296, 499–502`
+First reported 2026-06-10. `plan_capture` for the X11 named-window clipboard path still emits `{output}` placeholders; `execute_plan`'s clipboard branch calls `run_command(command)` without `output=`, triggering `die()` with exit 64. Unresolved as of main branch at this review.
+
+**[medium, carry-over] `--query` silently discarded when `--target` is `fullscreen` or `active`**
+`capture_screenshot.py:main()` (~lines 591–596)
+First reported 2026-06-13. No guard has been added; the silent-discard behaviour that contradicts the privacy-first design goal remains present. Unresolved as of main branch at this review.
+
+**[low] `test_windows_delegates_to_powershell` does not assert `-OutputRoot` forwarding**
+`tests/test_capture_screenshot.py:303–326`
+The test verifies that `-ConsentConfirmed`, `-Destination`, `-Target`, and `-DryRun` are correctly forwarded to the PowerShell stub, but `-OutputRoot` is absent from the checked list. A regression in `_run_powershell_script` that drops or renames the `-OutputRoot` argument would be silent: PowerShell would fall back to its built-in default path (see the 2026-06-16 finding: on Server Core, `GetFolderPath('Desktop')` returns `""` and the effective root becomes the bare relative string `"screenshots"`), potentially writing screenshots outside the Python-validated home-contained root. The silence is especially concerning because `_validate_output_root` runs on the Python side against `args.output_root` before delegation, so any mismatch between the validated path and the path actually received by PowerShell would go undetected.
+_Suggested fix:_ Pass an explicit `--output-root` value in the test subprocess invocation and add `"-OutputRoot"` (plus the value) to the `for expected in ...` assertion loop.
+
+---
+
+### Data leaks
+
+No new findings. All window-title privacy invariants continue to hold across all three platform paths. The macOS helper source-modification attack vector described above (Security) would allow an attacker to run arbitrary code, but the currently shipped `find_macos_window_id.m` never writes window title strings to stdout or stderr — it emits only integer window IDs (stdout) and static reason tokens (`unknown`, `minimized`, `offscreen`) on stderr. Error messages in `capture_screenshot.py` and `capture_screenshot.ps1` continue to echo only user-supplied query text, never OS-reported window titles. `sanitize_label` strips URLs and non-alphanumeric content before embedding any query in output file paths.
+
+---
+
+### UX
+
+**[low] No integration test validates `-OutputRoot` forwarding through the full Windows delegation path**
+`tests/test_capture_screenshot.py:303–326`
+(Same root cause as the Bugs finding above.) The fake `powershell.exe` in `test_windows_delegates_to_powershell` captures and records all arguments it receives, but the test never asserts on `-OutputRoot`. There is no test that passes a custom `--output-root`, verifies the forwarded `-OutputRoot` value, and confirms that the PowerShell script would use it as the output directory root. A complete end-to-end check is blocked by the need for a real Windows PS environment, but the missing assertion is fixable in the existing fake-shell framework on Linux/macOS CI.
+_Suggested fix:_ Same as the Bugs entry — pass `--output-root` explicitly and add it to the checked flags list.
+
+**[info, carry-over] `--query` silently discarded with non-window targets (first reported 2026-06-13)**
+Still unresolved as of this review. No new technical information.
+
+**[info, carry-over] PS1 has no `-OutputRoot` home-directory containment check when invoked directly (first reported 2026-06-23)**
+Still unresolved as of this review. No new technical information.
+

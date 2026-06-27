@@ -2043,3 +2043,113 @@ Still unresolved as of this review. No new technical information.
 **[info, carry-over] PS1 has no `-OutputRoot` home-directory containment check when invoked directly (first reported 2026-06-23)**
 Still unresolved as of this review. No new technical information.
 
+---
+
+## 2026-06-27
+
+### Security
+
+**[low] `resolve_macos_with_helper` does not handle exit code 64 from the macOS helper binary**
+`capture_screenshot.py:354–365` (`resolve_macos_with_helper` exit-code dispatch)
+`find_macos_window_id.m` exits with code 64 (EX_USAGE) for two cases: (a) called without
+`--frontmost` and without a positional query (line 52), and (b) `CFStringCreateWithCString`
+returns NULL for a non-UTF-8 query string (line 60). Python's dispatch block only handles
+return codes 0, 2, 3, and 4; any other code — including 64 — falls through to
+`ResolutionResult(False, "window_query_failed", "Could not query the window list.")`. In
+practice code 64 is unreachable from normal Python invocation (Python always passes either
+`--frontmost` or the query as a well-formed UTF-8 list element), but a future refactor that
+incorrectly assembles `command` would surface an opaque "Could not query the window list"
+message instead of an actionable usage-error diagnostic. The incomplete dispatch also makes it
+harder to audit the full exit-code contract between the C helper and its Python caller.
+_Suggested fix:_ Add `if proc.returncode == 64: return ResolutionResult(False, "window_helper_usage_error", "macOS window helper reported a usage error — check query arguments.")` before the final catch-all return, and document the full exit-code table in a comment at the top of the dispatch block.
+
+---
+
+### Bugs & regressions
+
+**[low] PowerShell dry-run mode evaluates `Get-WindowBounds` before the dry-run guard runs, making `--dry-run` fragile**
+`capture_screenshot.ps1:375–376` (active-window path) and `capture_screenshot.ps1:399–401` (named-window loop)
+Both capture paths call `Capture-ToDestination` with `Get-WindowBounds -Handle $handle` as a
+positional argument. PowerShell evaluates all arguments before entering the function body, so
+`GetWindowRect` is called unconditionally — even in dry-run mode. The dry-run early-return
+check (`if ($DryRun) { ... return }`) at the top of `Capture-ToDestination` comes too late to
+prevent this real Win32 API call. If a matched window is destroyed or hidden between handle
+discovery (`Find-WindowHandles` / `GetForegroundWindow`) and the subsequent `Get-WindowBounds`
+call — a plausible race condition during rapid window switching or automated testing — `GetWindowRect`
+returns false and `Get-WindowBounds` throws `"could not read window bounds"`. This terminates the
+script with exit 1 under `$ErrorActionPreference = 'Stop'` even though `--dry-run` is supposed
+to be a safe planning-only pass that produces no side effects and requires no real-time window
+geometry. On a stable desktop this race is rare; under CI automation or window-management tests it
+is more likely.
+_Suggested fix:_ Change each call site from
+`Capture-ToDestination -Bounds (Get-WindowBounds -Handle $handle) -Label $label -Handle $handle`
+to passing `$handle` only, and move `Get-WindowBounds` inside `Capture-ToDestination` after the
+dry-run guard. In dry-run the bounds are unused, so computing them is waste. Alternatively, add a
+`$DryRun` pre-check before each `Get-WindowBounds` call in the outer scope.
+
+**[info] Multi-window desktop capture leaves already-committed PNGs when a later capture fails mid-loop**
+`capture_screenshot.py:507–519` (`execute_plan`, `for command, output in zip(...)` loop)
+When `--allow-multiple-matches` resolves N windows, `execute_plan` iterates `(command, output)`
+pairs sequentially. For each successful iteration the temp file is atomically renamed to the final
+output path and its path is printed to stdout. If the K-th capture fails — via `CalledProcessError`
+(per the 2026-06-11 finding) or `die()` from the overwrite guard — the `finally` block removes
+that iteration's temp file, but the already-committed PNGs from iterations 1 through K−1 remain
+on disk. A caller (agent or shell script) parsing stdout for the set of saved paths receives an
+incomplete listing with exit code 1; there is no explicit indication of which captures succeeded
+and no automatic cleanup of the partial set. The caller must correlate the printed paths against
+the error to determine which files are usable, and must manually delete any unwanted partial
+captures.
+_Suggested fix:_ Collect successfully committed paths in a list inside `execute_plan`. Wrap the
+iteration in a try/except that, on any error, deletes all paths already in the list before
+re-raising (or calling `die()`). This gives callers clean all-or-nothing semantics: either all N
+paths are present and exit is 0, or none are present and exit is non-zero.
+
+---
+
+### Data leaks
+
+No new findings. Window-title privacy invariants continue to hold across all three platform paths.
+The `Get-WindowBounds` dry-run race (above) involves only window geometry (integers from
+`RECT.Left/Top/Right/Bottom`) — no title metadata. The partial-capture orphan issue involves
+pixel-data files under the 0o700-secured output directory; no window title is embedded in file
+paths (labels come from `sanitize_label(query)`, not from OS-reported titles). Error messages on
+all three platforms continue to echo only the user-supplied query, never real window titles.
+
+---
+
+### UX
+
+**[low] README "background/occluded capture" claim is not qualified for Linux X11**
+`README.md` (the "What it does" and named-window example sections, added in commit b6aac65)
+The updated README states: "Grabs background & occluded windows by name — even when they're
+behind other windows — without raising them or stealing focus" and "Works even if the window is
+in the background or covered by other windows — it captures the window's own content without
+raising it or stealing focus." These claims are accurate for macOS (`screencapture -l` renders
+the specific window layer via CoreGraphics) and Windows (the `PrintWindow(PW_RENDERFULLCONTENT)`
+API renders the window's own content regardless of occlusion). On **Linux X11**, however, the
+capture tool is ImageMagick `import -window <id>`, which uses `XGetImage` against the X11 server.
+Modern composited Linux applications (GPU-accelerated GTK4/Qt6, Electron, browsers using
+WebGL/hardware decoding) do not maintain a persistent X11 backing store; the X server only holds
+the on-screen pixels for the window's visible region, not the window's own render buffer. For a
+window that is fully occluded by another window, `import -window` captures whatever the X server
+has in the backing store — typically stale content or a blank/black region — not the window's
+actual current content. The README's unconditional claim may lead Linux X11 users to expect
+behaviour that only holds on macOS and Windows, resulting in silent black or stale screenshots
+that are indistinguishable from a successful capture.
+_Suggested fix:_ Add a qualification to the README background-capture bullet:
+"macOS and Windows capture the window's own rendering even when occluded; on Linux X11, `import`
+captures the backing store, which may be blank or stale for GPU-composited applications." Or add
+a note to `references/dependencies.md` listing the Linux limitation.
+
+**[info, carry-over] Linux X11 named-window clipboard crashes with an opaque internal error (first reported 2026-06-10)**
+Still unresolved. No new technical information.
+
+**[info, carry-over] PowerShell parameter injection via `--query` values beginning with `-` (first reported 2026-06-25)**
+Still unresolved. No new technical information.
+
+**[info, carry-over] `--query` silently discarded with non-window targets (first reported 2026-06-13)**
+Still unresolved. No new technical information.
+
+**[info, carry-over] PS1 has no `-OutputRoot` home-directory containment check when invoked directly (first reported 2026-06-23)**
+Still unresolved. No new technical information.
+

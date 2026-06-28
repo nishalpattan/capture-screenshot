@@ -2153,3 +2153,81 @@ Still unresolved. No new technical information.
 **[info, carry-over] PS1 has no `-OutputRoot` home-directory containment check when invoked directly (first reported 2026-06-23)**
 Still unresolved. No new technical information.
 
+
+---
+
+## 2026-06-28
+
+### Security
+
+**[medium, carry-over] PowerShell parameter injection via `--query` values beginning with `-`**
+`capture_screenshot.py:539–540` (`_run_powershell_script`)
+First reported 2026-06-25. No fix has been applied: `parse_args` still imposes no constraint on query values that begin with `-`, and no regression test exists. A query value such as `"-DryRun"` causes PowerShell's `pwsh -File` parameter binder to activate `$DryRun` silently, producing a success exit code with no screenshot taken.
+_Suggested fix:_ Add a validation loop in `main()` before `_run_powershell_script` is called rejecting any `--query` value that starts with `-`, and add an integration test asserting `EXIT_USAGE` for that input with `CAPTURE_SCREENSHOT_TEST_PLATFORM=Windows`.
+
+**[low, carry-over] Compiled macOS helper source is not integrity-checked before execution**
+`capture_screenshot.py:325–365` (`resolve_macos_with_helper`), `scripts/find_macos_window_id.m`
+First reported 2026-06-26. No fix has been applied. An attacker with write access to the skill's `scripts/` directory could replace `find_macos_window_id.m`; the next capture invocation compiles and executes the modified source under the calling user's account.
+_Suggested fix:_ Tighten write permissions on the scripts directory during install (`chmod go-w`) or verify a stored SHA-256 of the source before invoking `clang`.
+
+**[low, carry-over] `resolve_macos_with_helper` does not handle exit code 64 from the macOS helper binary**
+`capture_screenshot.py:354–365` (exit-code dispatch)
+First reported 2026-06-27. No fix has been applied. Return code 64 (EX_USAGE) from `find_macos_window_id` falls through to the opaque `window_query_failed` catch-all rather than a specific diagnostic.
+_Suggested fix:_ Add a `proc.returncode == 64` branch returning a `window_helper_usage_error` result and document the full exit-code table in a comment.
+
+---
+
+### Bugs & regressions
+
+**[high, carry-over] Linux X11 named-window clipboard crashes with "internal error: missing output path"**
+`capture_screenshot.py:288–296, 499–502`
+First reported 2026-06-10. `plan_capture` for the X11 named-window clipboard path emits `{output}` placeholders; the clipboard branch of `execute_plan` calls `run_command(command)` without `output=`, triggering `die()` with exit 64. Unresolved as of this review.
+
+**[medium, carry-over] `--query` silently discarded when `--target` is `fullscreen` or `active`**
+`capture_screenshot.py:main()` (~lines 591–596)
+First reported 2026-06-13. No guard has been added; the silent-discard behaviour remains. Unresolved as of this review.
+
+**[low] `plan_capture` accepts a `label` parameter that is never used in its body**
+`capture_screenshot.py:200–299` (`plan_capture` function signature and its caller at line 629)
+`plan_capture` declares `label: str` but does not reference `label` anywhere in its body. The caller in `main()` evaluates `label=labels[0] if labels else "capture"` and passes the result, but the value is silently discarded by the function. `CapturePlan` objects contain only command tuples; label assignment remains entirely in `main()`'s `labels` list and `output_paths`. The dead parameter could mislead a future contributor into expecting the label to influence plan construction (e.g., embedding the label in output filenames within the plan) when it has no effect.
+_Suggested fix:_ Remove the `label` parameter from `plan_capture` and its call site. If a label-aware plan is needed in future, add it back with a documented role.
+
+**[low, carry-over] `test_windows_delegates_to_powershell` does not assert `-OutputRoot` forwarding**
+`tests/test_capture_screenshot.py:303–326`
+First reported 2026-06-26. `-OutputRoot` is still absent from the checked flag list. A regression that drops this argument would go undetected. Unresolved as of this review.
+
+**[low, carry-over] PowerShell dry-run evaluates `Get-WindowBounds` before the dry-run guard**
+`capture_screenshot.ps1:375–376` (active path) and `:399–401` (named-window loop)
+First reported 2026-06-27. `Get-WindowBounds` (and the real `GetWindowRect` Win32 call) is evaluated as a positional argument before `Capture-ToDestination` enters its `if ($DryRun)` early-return guard. A window destroyed between handle discovery and the bound check causes a fatal exception even under `--dry-run`. Unresolved as of this review.
+
+**[info, carry-over] Multi-window desktop capture leaves already-committed PNGs when a later capture fails mid-loop**
+`capture_screenshot.py:507–519` (`execute_plan`)
+First reported 2026-06-27. No atomic all-or-nothing rollback exists. Unresolved as of this review.
+
+---
+
+### Data leaks
+
+No new findings. Window-title privacy invariants continue to hold across all three platform paths. The dead `label` parameter in `plan_capture` involves only the user's query string (already sanitized by `sanitize_label` before being placed in file paths); no OS-reported window title is embedded. The macOS C helper continues to emit only integer window IDs on stdout and static reason tokens (`unknown`) on stderr. Error messages in `capture_screenshot.py` and `capture_screenshot.ps1` echo only the caller-supplied query text, never OS-reported titles.
+
+---
+
+### UX
+
+**[info] Empty request directories are created before capture planning and left behind on plan failure**
+`capture_screenshot.py:623` (`prepare_output_paths`) vs. `capture_screenshot.py:624–632` (`plan_capture` / `execute_plan`)
+`prepare_output_paths` is called (with `create=True`) before `plan_capture` runs. It creates the 0o700-secured `output_root` and a timestamped `request_dir` subdirectory (e.g., `~/Desktop/screenshots/06_28_2026_12_34_56/`). If `plan_capture` then returns `ok=False` (e.g., no screenshot tool found on the platform), `execute_plan` immediately calls `die()`, leaving the empty, timestamp-named subdirectory on disk. The directory is access-restricted and contains no data, so there is no privacy risk; however, the empty folder may confuse users who inspect the output location and see a timestamped directory with no screenshots in it.
+_Suggested fix:_ Move `prepare_output_paths` after `plan_capture` and the tool-detection logic, creating the directory only once the plan is confirmed as viable. Alternatively, delete the empty request dir in the failure path of `execute_plan` (only when `len(output_paths) > 0` and no file has been committed yet).
+
+**[low, carry-over] README "background/occluded capture" claim is not qualified for Linux X11**
+`README.md`
+First reported 2026-06-27. The Linux X11 `import -window` backing-store limitation is still undocumented in the README. Unresolved as of this review.
+
+**[info, carry-over] macOS helper binary is recompiled from source on every capture invocation**
+First reported 2026-06-25. Still unresolved; clang compilation adds 0.3–1 s latency to every macOS named-window or active-window capture.
+
+**[info, carry-over] `--query` silently discarded with non-window targets (first reported 2026-06-13)**
+Still unresolved as of this review. No new technical information.
+
+**[info, carry-over] PS1 has no `-OutputRoot` home-directory containment check when invoked directly (first reported 2026-06-23)**
+Still unresolved as of this review. No new technical information.

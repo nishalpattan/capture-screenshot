@@ -2231,3 +2231,123 @@ Still unresolved as of this review. No new technical information.
 
 **[info, carry-over] PS1 has no `-OutputRoot` home-directory containment check when invoked directly (first reported 2026-06-23)**
 Still unresolved as of this review. No new technical information.
+
+---
+
+## 2026-06-29
+
+### Security
+
+**[low] `Path.home()` in `parse_args` default and `_validate_output_root` raises unhandled `RuntimeError` when `$HOME` is unset**
+`capture_screenshot.py:523` (`_validate_output_root`) and `capture_screenshot.py:555` (`parse_args`, `--output-root` default)
+`Path.home()` raises `RuntimeError: 'HOME' environment variable not set.` on systems where neither
+`$HOME` is set nor the user has a parseable passwd entry — for example, minimal containers, CI
+runners, or environments where the calling process cleared the environment. In `parse_args`, the
+`--output-root` default is computed as `Path.home() / "Desktop" / "screenshots"`, evaluated on
+every call to `parse_args`. In `_validate_output_root`, `Path.home().resolve()` is called
+unconditionally. Either call propagates an unhandled `RuntimeError` traceback with exit code 1,
+bypassing all `die()` error handling and all structured exit codes. The `install.sh` HOME guard
+(2026-06-10 finding) protects the bash installer but the Python script itself has no equivalent
+guard. This is distinct from that finding — the Python module is a separate entry point.
+_Suggested fix:_ Wrap `Path.home()` calls in a helper that catches `RuntimeError` and converts it
+to `die("could not determine user home directory — ensure $HOME is set", EXIT_USAGE)`. For the
+`parse_args` default, use a sentinel of `None` and resolve the home path in `main()` after the
+guard check, rather than evaluating `Path.home()` at parse time.
+
+**[info] `find_macos_window_id.m` silently ignores a positional query when `--frontmost` is also supplied**
+`scripts/find_macos_window_id.m:51–54, 91–103`
+The usage guard at line 51 is `!frontmost && !query_arg`: it fires only when neither is present.
+When both `--frontmost` and a positional query are supplied, the guard passes, `query` is allocated
+via `CFStringCreateWithCString`, but inside the main loop the `if (frontmost)` branch is entered
+unconditionally, returning the first on-screen normal-layer window without consulting `query`. The
+positional argument is silently discarded. Python always passes one or the other — never both —
+so this is unreachable from the Python caller in normal operation. A direct invocation of the
+compiled binary from a shell script or alternative orchestrator, however, receives a valid exit-0
+result that ignores the search term with no warning. The 2026-06-23 finding documented silent-
+overwrite of multiple positional arguments; this is a distinct silent-ignore case specific to the
+`--frontmost`+positional combination.
+_Suggested fix:_ After the argument-parsing loop, add:
+`if (frontmost && query_arg) { fprintf(stderr, "error: --frontmost and a query are mutually exclusive\n"); return 64; }`
+This makes the interface unambiguous and prevents accidental misuse by direct callers.
+
+---
+
+### Bugs & regressions
+
+**[low] `copy_file_to_clipboard` performs no emptiness check on the temp PNG before piping to the clipboard tool**
+`capture_screenshot.py:468–478` (`copy_file_to_clipboard`) and `capture_screenshot.py:491–496` (`execute_plan`, `{temp-output}` clipboard branch)
+For the two-command clipboard path (`grim`+`wl-copy` on Wayland, `import`+`xclip`/`xsel` on X11),
+`execute_plan` calls `run_command(plan.commands[0], temp_output=temp_path)` to write the screenshot,
+then passes `temp_path` to `copy_file_to_clipboard`. That function reads all bytes with
+`data = path.read_bytes()` and pipes them to the clipboard tool with no check that `data` is
+non-empty or begins with PNG magic bytes `\x89PNG`. If the screenshot tool exits 0 but writes zero
+bytes — documented for `grim` on Wayland compositor frame-callback timeout, and for
+`import -window root` on headless X11 — `data = b""` is piped to `wl-copy --type image/png` or
+`xclip -t image/png`. Both tools accept empty stdin without error, setting an empty clipboard item.
+The script then prints `"clipboard"` and exits 0: a false-success signal. The 2026-06-22 finding
+covers the same empty-file failure for the desktop output path; this is the distinct clipboard-path
+variant (`execute_plan:491-496`) not addressed by that entry.
+_Suggested fix:_ After `run_command(plan.commands[0], temp_output=temp_path)` returns, check
+`temp_path.stat().st_size > 0`; if the file is empty, call
+`die("capture tool wrote no data — check display availability and screen recording permissions",
+EXIT_UNAVAILABLE)`. Alternatively, perform the check inside `copy_file_to_clipboard` before
+calling `read_bytes()`.
+
+**[low] `os.replace(temp_output, output)` in `execute_plan` propagates unhandled `OSError`**
+`capture_screenshot.py:514` (`execute_plan`, desktop output loop)
+`run_command` failures propagating as unhandled `CalledProcessError` are a known gap (first noted
+2026-06-11). The immediately following `os.replace()` on line 514 can also raise `OSError` — for
+example `ENOSPC` (disk full between temp-write and rename) or `EPERM` (filesystem remounted
+read-only). Such an exception propagates through `execute_plan` and `main()` as an unhandled
+Python traceback with exit code 1. The `finally` block correctly cleans up the temp file (which
+still exists if `os.replace` failed), but the error itself carries no structured exit code and no
+actionable message. On `--allow-multiple-matches` captures, paths from earlier iterations are
+already committed and printed to stdout (the 2026-06-27 partial-capture info finding), worsening
+the inconsistency.
+_Suggested fix:_ Wrap `os.replace(temp_output, output)` in `try/except OSError as e:` and call
+`die(f"could not rename screenshot to final path: {e.strerror}", EXIT_UNAVAILABLE)`, consistent
+with the structured-error pattern used for other I/O failures in the same function.
+
+**[high, carry-over] Linux X11 named-window clipboard crashes with "internal error: missing output path"**
+`capture_screenshot.py:288–296, 499–502`
+First reported 2026-06-10. Still unresolved as of this review.
+
+**[medium, carry-over] PowerShell parameter injection via `--query` values beginning with `-`**
+`capture_screenshot.py:539–540`
+First reported 2026-06-25. Still unresolved as of this review.
+
+**[medium, carry-over] `--query` silently discarded when `--target` is `fullscreen` or `active`**
+`capture_screenshot.py:main()` (~lines 596–605)
+First reported 2026-06-13. Still unresolved as of this review.
+
+---
+
+### Data leaks
+
+No new findings. All window-title privacy invariants continue to hold across all three platform
+paths. The `Path.home()` `RuntimeError` (above) reveals only an OS error message with no window
+title or screenshot content. The `find_macos_window_id.m` silent-ignore concerns only the caller-
+supplied query string — no OS-reported title is exposed. The `copy_file_to_clipboard` empty-file
+finding involves the absence of pixel data rather than its exposure. The `os.replace` exception
+path includes only OS error strings and the output file path (derived from `sanitize_label(query)`,
+not from an OS-reported window title). Error messages in `capture_screenshot.py` and
+`capture_screenshot.ps1` continue to echo only user-supplied query text, never real window titles.
+
+---
+
+### UX
+
+**[low, carry-over] README "background/occluded capture" claim is not qualified for Linux X11**
+`README.md`
+First reported 2026-06-27. The Linux X11 `import -window` backing-store limitation remains
+undocumented in the README. Still unresolved as of this review.
+
+**[info, carry-over] macOS helper binary is recompiled from source on every capture invocation**
+First reported 2026-06-24. Still unresolved; clang compilation adds 0.3–1 s latency per macOS
+named-window or active-window capture request.
+
+**[info, carry-over] `--query` silently discarded with non-window targets (first reported 2026-06-13)**
+Still unresolved as of this review. No new technical information.
+
+**[info, carry-over] PS1 has no `-OutputRoot` home-directory containment check when invoked directly (first reported 2026-06-23)**
+Still unresolved as of this review. No new technical information.

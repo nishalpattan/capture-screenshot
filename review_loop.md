@@ -2351,3 +2351,91 @@ Still unresolved as of this review. No new technical information.
 
 **[info, carry-over] PS1 has no `-OutputRoot` home-directory containment check when invoked directly (first reported 2026-06-23)**
 Still unresolved as of this review. No new technical information.
+
+---
+
+## 2026-06-30
+
+### Security
+
+**[info] Correction to 2026-06-13 TOCTOU finding: `os.replace`/`rename(2)` on POSIX replaces the symlink entry itself, not the symlink target**
+`capture_screenshot.py:514`
+The 2026-06-13 entry stated: "`os.replace()` on Linux atomically replaces the target of a symlink (i.e., it follows the link and overwrites the pointed-to file) rather than replacing the symlink itself." This is factually incorrect. POSIX `rename(2)` — which CPython's `os.replace` calls on Linux and macOS — replaces the directory entry at the destination path atomically. If the destination is a symlink, the symlink file itself is overwritten and removed; the symlink's target file is not written to. Consequently, the specific threat scenario described ("a screenshot written to an attacker-controlled path via a symlink placed at `output`") does not materialise: a symlink placed at `output` between the `exists()` check and `os.replace()` would be replaced by the screenshot file, not followed. The underlying TOCTOU window is real (a regular file created at `output` between the two calls would be overwritten without the overwrite guard firing), but the scenario is less dangerous than the 2026-06-13 description implied. The practical impact of the remaining race is further constrained by the 0o700 per-request directory, which prevents other users from creating files at `output` in the first place.
+_Suggested fix:_ Update the 2026-06-13 finding's description to reflect the correct `rename(2)` semantics and note that a hardlink planted at `output` by the same-user (or root) could still trigger a silent overwrite.
+
+**[low] PowerShell `Move-Item` TOCTOU: file created at `$path` between `Get-Item` check and `Move-Item` produces unstructured exit 1**
+`capture_screenshot.ps1:330–337`
+In `Capture-ToDestination`, the script guards against overwriting an existing destination with `Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue` (line 330) and throws a structured error if something is found. The actual rename on line 337 is `Move-Item -LiteralPath $tempPath -Destination $path -ErrorAction Stop`. Between these two lines, a race exists: if another process creates a file at `$path`, `Move-Item` without `-Force` fails with `System.IO.IOException: Cannot create a file when that file already exists.` Under `$ErrorActionPreference = 'Stop'` this is a terminating error that exits with code 1 — unstructured and indistinguishable from other runtime failures. Unlike Python's `os.replace` (which on POSIX replaces the destination atomically and raises only on cross-device moves), Windows `MoveFileEx` without `MOVEFILE_REPLACE_EXISTING` refuses to overwrite, so the race is a denial-of-service rather than an overwrite. The `finally` block removes `$tempPath` correctly. The practical risk on a single-user desktop is low; on shared machines with write access to the output directory it is a plausible denial-of-service for targeted capture requests.
+_Suggested fix:_ Wrap the `Move-Item` call in `try/catch [System.IO.IOException]` and emit `[Console]::Error.WriteLine("refusing to overwrite an existing screenshot path"); exit 73` to produce a structured, auditable exit code consistent with the intent of the preceding guard.
+
+**[low, carry-over] PowerShell parameter injection via `--query` values beginning with `-`**
+`capture_screenshot.py:539–540`
+First reported 2026-06-25. No fix applied. A query value such as `"-DryRun"` causes `pwsh -File` to activate `$DryRun` silently, producing exit 0 with no screenshot taken. Still unresolved as of main branch at this review.
+
+**[low, carry-over] Compiled macOS helper source is not integrity-checked before execution**
+`capture_screenshot.py:325–365`
+First reported 2026-06-26. No fix applied. Still unresolved as of this review.
+
+**[low, carry-over] `resolve_macos_with_helper` does not handle exit code 64 from the macOS helper binary**
+`capture_screenshot.py:354–365`
+First reported 2026-06-27. No fix applied. Still unresolved as of this review.
+
+**[low, carry-over] `Path.home()` raises unhandled `RuntimeError` when `$HOME` is unset**
+`capture_screenshot.py:523, 555`
+First reported 2026-06-29. No fix applied. Still unresolved as of this review.
+
+---
+
+### Bugs & regressions
+
+**[high, carry-over] Linux X11 named-window clipboard crashes with "internal error: missing output path"**
+`capture_screenshot.py:288–296, 499–502`
+First reported 2026-06-10. `plan_capture` emits `{output}` placeholders for the X11 named-window clipboard path; `execute_plan`'s clipboard branch calls `run_command(command)` without `output=`, triggering `die()` with exit 64. Still unresolved as of main branch at this review.
+
+**[medium, carry-over] `--query` silently discarded when `--target` is `fullscreen` or `active`**
+`capture_screenshot.py:main()` (~lines 596–605)
+First reported 2026-06-13. No guard added; the silent-discard behaviour that contradicts the privacy-first design goal remains present. Still unresolved as of this review.
+
+**[medium, carry-over] Windows dry-run with `--allow-multiple-matches` reports duplicate output paths for same-label windows**
+`capture_screenshot.ps1` (`New-CapturePath`, `Capture-ToDestination`)
+First reported 2026-06-23. `New-CapturePath` checks filesystem existence; in dry-run no files are written so the collision guard never fires and duplicate paths are returned. Still unresolved as of this review.
+
+**[low] No regression test for `_validate_output_root` rejecting a path outside the user home directory**
+`tests/test_capture_screenshot.py`, `capture_screenshot.py:522–527`
+`_validate_output_root` is the sole Python-side guard ensuring screenshots are never written outside the user's home directory. Its failure path — `die("output-root must be within the user home directory", EXIT_USAGE)` — is exercised by no test in the current suite. If a future refactor weakens or removes this check, no existing test would catch the regression. Given that the Python home-containment guard is the primary protection for the non-Windows path (the PS1 script has no equivalent check when invoked directly, noted in the 2026-06-08 and 2026-06-23 entries), a silently broken guard would allow writes to arbitrary locations such as `/tmp/screenshots` or `/etc/screenshots` without any other safety net.
+_Suggested fix:_ Add an integration test that invokes the script subprocess with `--output-root /tmp/screenshots` and asserts `proc.returncode == EXIT_USAGE` and a message containing "home directory". Add a companion positive test that a path within `$HOME` passes validation without error.
+
+**[low, carry-over] `test_windows_delegates_to_powershell` does not assert `-OutputRoot` forwarding**
+`tests/test_capture_screenshot.py:303–326`
+First reported 2026-06-26. Still unresolved as of this review.
+
+**[low, carry-over] PowerShell dry-run evaluates `Get-WindowBounds` before the dry-run guard**
+`capture_screenshot.ps1:375–376, 399–401`
+First reported 2026-06-27. Still unresolved as of this review.
+
+**[low, carry-over] `os.replace()` in `execute_plan` propagates unhandled `OSError`**
+`capture_screenshot.py:514`
+First reported 2026-06-29. Still unresolved as of this review.
+
+---
+
+### Data leaks
+
+No new findings. Window-title privacy invariants continue to hold across all three platform paths. The `Move-Item` TOCTOU produces an error rather than a data leak — the screenshot bytes never reach an attacker-visible location. The `_validate_output_root` test gap involves a missing regression test, not an active data-exposure path (the guard itself is correctly implemented in the current code). The correction to the 2026-06-13 `os.replace` finding actually reduces the stated risk: an attacker cannot redirect the screenshot to an arbitrary path via a symlink planted at `output` because `rename(2)` replaces the symlink itself rather than following it. All error messages continue to echo only the user-supplied query text, never OS-reported window titles. `sanitize_label` strips URLs and non-alphanumeric characters before embedding labels in filesystem paths.
+
+---
+
+### UX
+
+**[low, carry-over] README "background/occluded capture" claim is not qualified for Linux X11**
+`README.md`
+First reported 2026-06-27. The Linux X11 `import -window` backing-store limitation remains undocumented in the README. Still unresolved as of this review.
+
+**[info, carry-over] macOS helper binary is recompiled from source on every capture invocation**
+First reported 2026-06-24. Still unresolved; clang compilation adds 0.3–1 s latency per macOS named-window or active-window capture request.
+
+**[info, carry-over] `--query` silently discarded with non-window targets (first reported 2026-06-13)**
+Still unresolved as of this review. No new technical information.
+
+**[info, carry-over] PS1 has no `-OutputRoot` home-directory containment check when invoked directly (first reported 2026-06-23)**
+Still unresolved as of this review. No new technical information.

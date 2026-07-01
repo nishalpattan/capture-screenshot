@@ -2439,3 +2439,107 @@ Still unresolved as of this review. No new technical information.
 
 **[info, carry-over] PS1 has no `-OutputRoot` home-directory containment check when invoked directly (first reported 2026-06-23)**
 Still unresolved as of this review. No new technical information.
+
+---
+
+## 2026-07-01
+
+### Security
+
+**[medium] Whitespace-only `--query` bypasses the empty-string rejection proposed on 2026-06-13**
+`capture_screenshot.py:133` (`_matches`), `capture_screenshot.ps1:212–213` (`Find-WindowHandles`), `find_macos_window_id.m:107` (`contains`)
+
+`_matches(" ", title)` in Python evaluates `bool(" ")` as `True` and `" " in title.casefold()` as `True` for virtually every window title that contains a space — which is nearly all of them.  On Windows, `title.IndexOf(" ", StringComparison.OrdinalIgnoreCase)` returns ≥ 0 for any space-containing title, and similarly `processName.IndexOf(" ", …)` does the same.  On macOS the C helper calls `CFStringFind(title, CFSTR(" "), kCFCompareCaseInsensitive)` with identical over-broad results.  On Linux, `xdotool search --name " "` matches every window whose name contains a space.
+
+The 2026-06-13 proposed fix checks `if not q` (empty string only); it does not reject `" "`.  The filename fallback (`sanitize_label(" ")` → `""` → `"capture"`) hides any indication of over-broad scope from the output path — the caller receives files named `capture.png`, `capture-001.png`, etc., with no indication that dozens of windows matched.
+
+`allow_multiple=False` path: if exactly one matching window happens to be on-screen the capture proceeds silently on what may be an unintended window.  `allow_multiple=True` path: all on-screen windows with a space in their title are captured.
+
+**Fix:** in `capture_screenshot.py`, add `if not q.strip(): sys.exit(EXIT_USAGE)` in argument validation before any platform dispatch.  In `capture_screenshot.ps1`, add a guard `if ([string]::IsNullOrWhiteSpace($queryText)) { throw 'query must not be blank or whitespace-only' }`.  The C helper requires no change because the Python/PowerShell callers gate the value before invoking it.
+
+**[low, carry-over] PowerShell `--query` parameter injection (first reported 2026-06-25)**
+Still unresolved as of this review. `_run_powershell_script` passes each query value as a bare `-Query q` element; a value like `; Start-Process calc` could inject a new statement.
+
+**[low] `Protect-Directory` creates intermediate parent directories with world-accessible ACLs**
+`capture_screenshot.ps1:93` (`Protect-Directory`)
+
+`New-Item -ItemType Directory -Path $Path -Force` creates all missing intermediate parent directories.  Only the leaf directory (`$Path` itself) then receives `Set-Acl` with the owner-only `FileSystemAccessRule`.  Any intermediate directories that did not previously exist are created with Windows inherited (default) ACLs — typically world-traversable — and are never explicitly locked down.
+
+This is the PowerShell analogue of the Python `parents=True` finding documented on 2026-06-16 but has not been explicitly raised for the PS code path.  In practice the `OutputRoot` is typically `Desktop\screenshots`, so the only intermediate directory created is `screenshots` itself, which then receives the owner-only ACL in the `New-RequestFolder`-level call.  The risk materialises when `--output-root` points to a deep path whose parents do not yet exist.
+
+**Fix:** walk `$Path`'s ancestors from root to leaf and call `Set-Acl` on each intermediate directory that was just created by `New-Item -Force`, or create them one level at a time with explicit ACLs.  Alternatively restrict `OutputRoot` depth so intermediate parents cannot be newly created.
+
+**[low, carry-over] Compiled macOS C helper source not integrity-checked at runtime (first reported 2026-06-26)**
+Still unresolved as of this review.
+
+**[low, carry-over] `Path.home()` can raise `RuntimeError` on misconfigured systems (first reported 2026-06-29)**
+Still unresolved as of this review.
+
+**[low, carry-over] `Move-Item` TOCTOU window between `New-CapturePath` and the actual rename (first reported 2026-06-30)**
+Still unresolved as of this review.
+
+---
+
+### Bugs & regressions
+
+**[low] Partial `git clone` leaves a stale directory; next `install.sh` run silently reports "already installed"**
+`install.sh:19–21, 27`
+
+`set -euo pipefail` (line 2) causes the script to exit immediately if `git clone` returns non-zero (network interruption, disk-full mid-clone, authentication failure).  `git clone` may have already created the destination directory and begun writing objects into it before failing, leaving a partial directory tree on disk.
+
+On the next `install.sh` invocation, `[ -d "$dest" ]` at line 19 is `true`, so the function prints `"$label already installed at $dest — skipping"` and returns without retrying the clone.  The user is given no indication that the prior install was incomplete; the partial directory is treated as a successful installation.
+
+**Fix:** after `git clone` fails (or before the early-return guard), verify that the destination directory contains a valid Git repository (e.g., `git -C "$dest" rev-parse HEAD >/dev/null 2>&1`), and retry or report an error if it does not.  Alternatively, on clone failure clean up the partial directory with `rm -rf "$dest"` so the early-return guard does not trigger on the next run.
+
+**[high, carry-over] Linux X11 named-window clipboard path crashes (first reported 2026-06-10)**
+Still unresolved as of this review.
+
+**[medium, carry-over] `--query` silently discarded with non-window `--target` values (first reported 2026-06-13)**
+Still unresolved as of this review.
+
+**[medium, carry-over] Windows dry-run `allow_multiple` produces duplicate output paths (first reported 2026-06-23)**
+Still unresolved as of this review.
+
+**[medium, carry-over] PowerShell `--query` parameter injection (first reported 2026-06-25)**
+Still unresolved as of this review.
+
+**[low, carry-over] No regression test for `_validate_output_root` (first reported 2026-06-30)**
+Still unresolved as of this review.
+
+**[low, carry-over] `test_windows_delegates_to_powershell` does not assert `-OutputRoot` forwarding (first reported 2026-06-26)**
+Still unresolved as of this review.
+
+**[low, carry-over] PowerShell dry-run evaluates `Get-WindowBounds` before the `$DryRun` guard (first reported 2026-06-27)**
+Still unresolved as of this review.
+
+**[low, carry-over] `os.replace()` in `execute_plan` propagates unhandled `OSError` (first reported 2026-06-29)**
+Still unresolved as of this review.
+
+---
+
+### Data leaks
+
+No new findings. The whitespace-only `--query` security finding (above) involves scope over-extension — more windows captured than intended — but `sanitize_label` converts the blank/whitespace value to `"capture"` before embedding it in any filesystem path or output message, so window-title content is not exposed.  All window-title privacy invariants continue to hold across all three platform paths.  Error messages and dry-run output continue to echo only the user-supplied query string, never OS-reported window titles.
+
+---
+
+### UX
+
+**[low] No test asserts that a whitespace-only `--query` triggers `EXIT_USAGE`**
+`tests/test_capture_screenshot.py`
+
+The existing test suite checks `test_requires_explicit_consent` for `EXIT_PRIVACY` and `test_macos_named_window_plan_does_not_fallback_to_fullscreen` for the no-window-found path, but there is no test for `--query " "` (whitespace-only query).  This is a direct companion gap to the security finding above: without a test, a future whitespace-guard fix can be removed or bypassed without a CI signal.
+
+**Suggested test:** a subprocess test that runs with `--query " "` and asserts `returncode == EXIT_USAGE` and that the combined stderr/stdout does not contain any window-title text.
+
+**[low, carry-over] README "background/occluded capture" claim is not qualified for Linux X11**
+First reported 2026-06-27. Still unresolved as of this review.
+
+**[info, carry-over] macOS helper binary is recompiled from source on every capture invocation**
+First reported 2026-06-24. Still unresolved; clang compilation adds 0.3–1 s latency per macOS named-window or active-window capture request.
+
+**[info, carry-over] `--query` silently discarded with non-window targets (first reported 2026-06-13)**
+Still unresolved as of this review.
+
+**[info, carry-over] PS1 has no `-OutputRoot` home-directory containment check when invoked directly (first reported 2026-06-23)**
+Still unresolved as of this review.

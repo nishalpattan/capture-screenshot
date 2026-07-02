@@ -2543,3 +2543,108 @@ Still unresolved as of this review.
 
 **[info, carry-over] PS1 has no `-OutputRoot` home-directory containment check when invoked directly (first reported 2026-06-23)**
 Still unresolved as of this review.
+
+---
+
+## 2026-07-02
+
+### Security
+
+**[low, NEW] `ensure_private_directory` TOCTOU between `is_symlink()` check and `mkdir()` call**
+`capture_screenshot.py:92–103` (`ensure_private_directory`)
+
+`is_symlink()` is called and, if it returns `False`, `path.mkdir(mode=0o700, parents=True, exist_ok=True)` is invoked. Between these two calls an attacker who controls the parent directory could create a symlink at `path`. With `exist_ok=True`, `mkdir()` would follow the symlink, silently succeed if the symlink target is an existing directory, and all subsequent `chmod(0o700)` and file writes would operate on the symlink target rather than the intended path. On a shared system this could be used to redirect screenshot output or to apply restrictive permissions to an attacker-chosen directory. Exploitability is low on a single-user machine where only the owner controls `$HOME`.
+
+**Suggested fix:** After `mkdir()`, re-check `path.is_symlink()` (or use `os.lstat()` and verify the path is a real directory), and die if the check now returns True. Alternatively use `os.open(path, os.O_DIRECTORY | os.O_NOFOLLOW)` after creation to get a symlink-safe fd and verify it.
+
+**[medium, carry-over] Whitespace-only `--query` bypasses the empty-string rejection (first reported 2026-07-01)**
+Still unresolved as of this review.
+
+**[low, carry-over] PowerShell `--query` parameter injection (first reported 2026-06-25)**
+Still unresolved as of this review.
+
+**[low, carry-over] `Protect-Directory` creates intermediate parent directories with world-accessible ACLs (first reported 2026-07-01)**
+Still unresolved as of this review.
+
+**[low, carry-over] Compiled macOS C helper source not integrity-checked at runtime (first reported 2026-06-26)**
+Still unresolved as of this review.
+
+**[low, carry-over] `Path.home()` can raise `RuntimeError` on misconfigured systems (first reported 2026-06-29)**
+Still unresolved as of this review.
+
+**[low, carry-over] `Move-Item` TOCTOU window between `New-CapturePath` and the actual rename (first reported 2026-06-30)**
+Still unresolved as of this review.
+
+---
+
+### Bugs & regressions
+
+**[low, NEW] `unique_capture_path` exits with `EXIT_PRIVACY` (73) on filename-slot exhaustion**
+`capture_screenshot.py:104` (`unique_capture_path`)
+
+When all 1000 filename slots are occupied, `die("could not allocate a unique screenshot filename", EXIT_PRIVACY)` exits with code 73. Running out of filename slots is a resource-exhaustion condition, not a privacy violation — exit code `EXIT_USAGE` (64) would better reflect the cause and avoid confusing agents or callers that inspect the exit code to distinguish privacy errors from other failures.
+
+**Suggested fix:** Change the `die()` call in `unique_capture_path` to use `EXIT_USAGE` instead of `EXIT_PRIVACY`.
+
+**[low, NEW] Unhandled `CalledProcessError` from `clang` compilation surfaces as Python traceback**
+`capture_screenshot.py:~283` (`resolve_macos_with_helper`)
+
+`subprocess.run([clang, "-framework", "ApplicationServices", str(helper_source), "-o", str(helper)], check=True)` raises `subprocess.CalledProcessError` on compilation failure (SDK header change, disk full, permission error). This propagates unhandled through `main()` and prints a raw Python traceback to stderr. Every other error path in the script uses `die()` for structured, agent-parseable error output. The inconsistency makes macOS helper compilation failures harder to diagnose from agent output.
+
+**Suggested fix:** Wrap the clang `subprocess.run` in a `try/except subprocess.CalledProcessError` and call `die("macOS window helper compilation failed", EXIT_UNAVAILABLE)` with a brief description.
+
+**[high, carry-over] Linux X11 named-window clipboard path crashes (first reported 2026-06-10)**
+Still unresolved as of this review.
+
+**[medium, carry-over] `--query` silently discarded with non-window `--target` values (first reported 2026-06-13)**
+Still unresolved as of this review.
+
+**[medium, carry-over] Windows dry-run `allow_multiple` produces duplicate output paths (first reported 2026-06-23)**
+Still unresolved as of this review.
+
+**[low, carry-over] Partial `git clone` leaves a stale directory; next `install.sh` run silently reports "already installed" (first reported 2026-07-01)**
+Still unresolved as of this review.
+
+**[low, carry-over] No regression test for `_validate_output_root` (first reported 2026-06-30)**
+Still unresolved as of this review.
+
+**[low, carry-over] `test_windows_delegates_to_powershell` does not assert `-OutputRoot` forwarding (first reported 2026-06-26)**
+Still unresolved as of this review.
+
+**[low, carry-over] PowerShell dry-run evaluates `Get-WindowBounds` before the `$DryRun` guard (first reported 2026-06-27)**
+Still unresolved as of this review.
+
+**[low, carry-over] `os.replace()` in `execute_plan` propagates unhandled `OSError` (first reported 2026-06-29)**
+Still unresolved as of this review.
+
+---
+
+### Data leaks
+
+No new findings. All window-title privacy invariants continue to hold across macOS, Linux, and Windows paths. The whitespace-only `--query` finding (Security above) causes over-broad window matching but `sanitize_label` converts the blank/whitespace label to `"capture"` before writing any filesystem path, so no window-title content leaks into output filenames or messages. Error messages and dry-run output continue to echo only the user-supplied query string.
+
+---
+
+### UX
+
+**[info, NEW] `first_capturable` variable name in `find_macos_window_id.m` is misleading**
+`scripts/find_macos_window_id.m:~97–113`
+
+In the single-match path (`!allow_multiple`), each iteration overwrites `first_capturable = number`, so after the loop the variable holds the *last* capturable window ID encountered, not the first. The behavior is correct only because when `capturable_count > 1` the code returns exit 3 (multiple matches) without reading `first_capturable`, and when `capturable_count == 1` there is exactly one assignment. The misleading name could confuse a future maintainer into thinking the front-to-back iteration order guarantees the topmost window is returned when allow_multiple is false.
+
+**Suggested fix (naming only):** Rename `first_capturable` to `single_capturable` or `matched_capturable` to make the invariant explicit.
+
+**[low, carry-over] No test asserts that whitespace-only `--query` triggers `EXIT_USAGE` (first reported 2026-07-01)**
+Still unresolved as of this review.
+
+**[low, carry-over] README "background/occluded capture" claim is not qualified for Linux X11 (first reported 2026-06-27)**
+Still unresolved as of this review.
+
+**[info, carry-over] macOS helper binary is recompiled from source on every capture invocation (first reported 2026-06-24)**
+Still unresolved as of this review. Clang compilation adds 0.3–1 s latency per macOS named-window or active-window capture request.
+
+**[info, carry-over] `--query` silently discarded with non-window targets (first reported 2026-06-13)**
+Still unresolved as of this review.
+
+**[info, carry-over] PS1 has no `-OutputRoot` home-directory containment check when invoked directly (first reported 2026-06-23)**
+Still unresolved as of this review.

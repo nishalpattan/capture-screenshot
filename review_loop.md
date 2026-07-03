@@ -2648,3 +2648,99 @@ Still unresolved as of this review.
 
 **[info, carry-over] PS1 has no `-OutputRoot` home-directory containment check when invoked directly (first reported 2026-06-23)**
 Still unresolved as of this review.
+
+## 2026-07-03
+
+### Security
+
+No new findings.
+
+**[medium, carry-over] Whitespace-only `--query` bypasses empty-string rejection (`capture_screenshot.py`, first reported 2026-07-01)**
+Still unresolved as of this review.
+
+**[low, carry-over] PowerShell `--query` value injection via `-`-prefixed strings (`capture_screenshot.py:_run_powershell_script`, first reported 2026-06-25)**
+Still unresolved as of this review.
+
+**[low, carry-over] TOCTOU between `is_symlink()` and `mkdir()` in `ensure_private_directory` (`capture_screenshot.py`, first reported 2026-07-02)**
+Still unresolved as of this review.
+
+**[low, carry-over] `Protect-Directory` creates intermediate parent directories with world-accessible ACLs (`capture_screenshot.ps1`, first reported 2026-07-01)**
+Still unresolved as of this review.
+
+**[low, carry-over] Compiled macOS C helper source not integrity-checked at runtime (`capture_screenshot.py:resolve_macos_with_helper`, first reported 2026-06-26)**
+Still unresolved as of this review.
+
+**[low, carry-over] `Path.home()` raises `RuntimeError` on misconfigured systems (`capture_screenshot.py:_validate_output_root`, first reported 2026-06-29)**
+Still unresolved as of this review.
+
+**[low, carry-over] `Move-Item` TOCTOU between existence check and rename (`capture_screenshot.ps1`, first reported 2026-06-30)**
+Still unresolved as of this review.
+
+### Bugs & regressions
+
+**[low, NEW] `private_temp_png` catches only `FileExistsError`, leaving other `OSError` subtypes as unhandled tracebacks (`capture_screenshot.py:444`)**
+
+`os.open(temp_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)` is wrapped in a retry loop that catches only `FileExistsError`. Other `OSError` subclasses — `PermissionError` (EPERM/EACCES), disk-full (`ENOSPC`), read-only filesystem (`EROFS`) — propagate as raw Python tracebacks with exit code 1, bypassing `die()` and producing no structured error message or documented exit code. This is the same class of omission previously documented for `secure_file` (2026-06-18, catches only `PermissionError`) and `ensure_private_directory` (2026-06-19), but `private_temp_png` has not been called out before.
+
+Suggested fix: change `except FileExistsError: continue` to:
+```python
+except OSError as e:
+    if e.errno == errno.EEXIST:
+        continue
+    die(f"could not create private temporary screenshot file: {e.strerror}", EXIT_PRIVACY)
+```
+(and add `import errno` at the top of the file).
+
+**[high, carry-over] X11 clipboard capture crashes with `subprocess.CalledProcessError` when no window matches xdotool search (`capture_screenshot.py:resolve_linux_named_window`, first reported 2026-06-30)**
+Still unresolved as of this review.
+
+**[medium, carry-over] Supplied `--query` is silently discarded when target is not `window` (`capture_screenshot.py:main`, first reported 2026-07-01)**
+Still unresolved as of this review.
+
+**[medium, carry-over] Windows dry-run emits duplicate output lines when multiple capture commands are planned (`capture_screenshot.ps1`, first reported 2026-07-01)**
+Still unresolved as of this review.
+
+**[low, carry-over] `unique_capture_path` does not call `die()` on unexpected `OSError`; propagates raw traceback (`capture_screenshot.py`, first reported 2026-07-02)**
+Still unresolved as of this review.
+
+**[low, carry-over] `CalledProcessError` from clang compilation surfaces as unstructured traceback rather than a clean `die()` message (`capture_screenshot.py:resolve_macos_with_helper`, first reported 2026-06-28)**
+Still unresolved as of this review.
+
+**[low, carry-over] Partial git clone of repo into skills directory not cleaned up on interruption (`install.sh`, first reported 2026-06-26)**
+Still unresolved as of this review.
+
+**[low, carry-over] Test coverage gap: no test for `private_temp_png` failure modes other than name collision (`tests/test_capture_screenshot.py`, first reported 2026-06-18)**
+Still unresolved as of this review.
+
+### Data leaks
+
+No new findings.
+
+### UX
+
+**[low, RE-FLAGGED from 2026-06-17] Unquoted temp-file path in `test_windows_delegates_to_powershell` generated shell script (`tests/test_capture_screenshot.py:309`)**
+
+The fake PowerShell stub script is written with an unquoted `args_file` path:
+```python
+fake_ps.write_text(
+    f'#!/bin/sh\nprintf "%s\\n" "$@" > {args_file}\necho "fake/path.png"\n'
+)
+```
+First documented 2026-06-17 but subsequently dropped from carry-over tracking without being fixed. On CI runners where `TMPDIR` contains spaces (e.g. `/home/runner/work/tmp dir`), the shell redirect is parsed incorrectly — the path is word-split, causing a false test failure that masks the real PowerShell delegation behavior under test.
+
+Suggested fix: quote the embedded path as `> "{args_file}"`, or use `shlex.quote(str(args_file))` when building the shell string.
+
+**[low, carry-over] No test asserts that whitespace-only `--query` triggers `EXIT_USAGE` (first reported 2026-07-01)**
+Still unresolved as of this review.
+
+**[low, carry-over] README "background/occluded capture" claim is not qualified for Linux X11 (first reported 2026-06-27)**
+Still unresolved as of this review.
+
+**[info, carry-over] macOS helper binary is recompiled from source on every capture invocation (first reported 2026-06-24)**
+Still unresolved as of this review. Clang compilation adds 0.3–1 s latency per macOS named-window or active-window capture request.
+
+**[info, carry-over] `--query` silently discarded with non-window targets (first reported 2026-06-13)**
+Still unresolved as of this review.
+
+**[info, carry-over] PS1 has no `-OutputRoot` home-directory containment check when invoked directly (first reported 2026-06-23)**
+Still unresolved as of this review.

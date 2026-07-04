@@ -2744,3 +2744,91 @@ Still unresolved as of this review.
 
 **[info, carry-over] PS1 has no `-OutputRoot` home-directory containment check when invoked directly (first reported 2026-06-23)**
 Still unresolved as of this review.
+
+---
+
+## 2026-07-04
+
+### Security
+
+**[medium] Clipboard capture (grim / import path) stores screenshot PNG in system `/tmp` rather than the secured 0o700 request directory (`capture_screenshot.py:492`)**
+
+When `--destination clipboard` is used on Linux with `grim` or `import`, `execute_plan` creates a temporary PNG via `tempfile.NamedTemporaryFile(prefix="capture-screenshot.", suffix=".png")`. This lands in the system temp directory (usually `/tmp`) — outside the 0o700 request directory that desktop captures use. Python's `NamedTemporaryFile` creates files at mode 0o600 by default (the mode is subject to umask; with a pathological umask of 0o177 the result can be 0o000, readable only by root). The contrast with the desktop code path (`private_temp_png` + `secure_file`, all inside the 0o700 request directory) means clipboard captures have a weaker privacy guarantee for the brief interval the PNG lives on disk. On a shared machine, a root process can inspect `/tmp` regardless of permissions.
+
+Suggested fix: instead of `NamedTemporaryFile`, create the temp file inside `ensure_private_directory`-protected request directory using `private_temp_png`, then pipe the bytes to the clipboard tool and delete it — matching the security model of the desktop path.
+
+**[low] `kCGWindowListOptionAll` in macOS helper enumerates windows from every user session on a shared macOS system (`find_macos_window_id.m:68`)**
+
+`CGWindowListCopyWindowInfo(kCGWindowListOptionAll, kCGNullWindowID)` returns window metadata (owner names, window titles) for all GUI processes on the system, including those belonging to other logged-in users in fast-user-switching sessions. A query string that happens to partially match another user's application name could return that user's window information (owner/title metadata used for matching). The actual capture step (`screencapture -l <id>`) would likely be denied by macOS SIP/security, but the metadata is returned and the window ID printed to stdout. On single-user systems (the common case) this is a non-issue.
+
+Suggested fix: document the limitation, or filter the window list with `kCGWindowListOptionOnScreenOnly` for shared system deployments (noting this would miss minimized/off-Space windows, requiring a separate all-windows pass for the "present but not capturable" case).
+
+### Bugs & regressions
+
+**[low] `$matches` in `Find-WindowHandles` shadows PowerShell's automatic `$Matches` variable under `Set-StrictMode -Version Latest` (`capture_screenshot.ps1:204`)**
+
+`Find-WindowHandles` declares `$matches = [System.Collections.Generic.List[IntPtr]]::new()`. In PowerShell, `$Matches` (case-insensitive) is an automatic variable populated by the `-match` and `-replace` regex operators. Under `Set-StrictMode -Version Latest`, assigning to a name that aliases an automatic variable is permitted but causes subtle hazards: any `-match` expression evaluated later in the same scope would overwrite `$matches` with a hashtable, silently replacing the window-handle list and causing `return $matches` to return a hashtable instead of a `List[IntPtr]`. While no `-match` expression currently exists in `Find-WindowHandles`, the clash is a maintenance trap.
+
+Suggested fix: rename the local collection to `$windowHandles` (or similar) throughout `Find-WindowHandles`.
+
+**[low] `run_command` and the macOS helper compile step have no timeout; a hanging tool blocks the CLI indefinitely (`capture_screenshot.py:339`, `capture_screenshot.py:465`)**
+
+Both `subprocess.run([clang, ...], check=True)` (compile) and `subprocess.run(args, check=True)` (screenshot tool) specify no `timeout=` argument. A tool that hangs (e.g., `screencapture` waiting for a permission dialog that never appears, `grim` blocked on a Wayland compositor event, or `clang` running on a degraded system) will freeze the calling agent indefinitely with no recovery path.
+
+Suggested fix: add a reasonable `timeout` (e.g., 30 s for screencapture/grim, 60 s for clang) and catch `subprocess.TimeoutExpired` to call `die("capture tool timed out", EXIT_UNAVAILABLE)`.
+
+### Carry-overs (unresolved from prior entries)
+
+**[high, carry-over] `CalledProcessError` from `subprocess.run(check=True)` propagates as a raw Python traceback for any tool failure (`capture_screenshot.py:339,465`, first reported 2026-06-09)**
+Still unresolved.
+
+**[high, carry-over] X11 clipboard capture crashes with `subprocess.CalledProcessError` when xdotool search returns no matches (`capture_screenshot.py:resolve_linux_named_window`, first reported 2026-06-30)**
+Still unresolved.
+
+**[medium, carry-over] Supplied `--query` is silently discarded when target is not `window` (`capture_screenshot.py:main`, first reported 2026-07-01)**
+Still unresolved.
+
+**[medium, carry-over] Windows dry-run emits duplicate output lines when multiple capture commands are planned (`capture_screenshot.ps1`, first reported 2026-07-01)**
+Still unresolved.
+
+**[low, carry-over] `unique_capture_path` does not call `die()` on unexpected `OSError`; propagates raw traceback (`capture_screenshot.py`, first reported 2026-07-02)**
+Still unresolved.
+
+**[low, carry-over] `CalledProcessError` from clang compilation surfaces as unstructured traceback rather than a clean `die()` message (`capture_screenshot.py:resolve_macos_with_helper`, first reported 2026-06-28)**
+Still unresolved.
+
+**[low, carry-over] `private_temp_png` swallows non-`EEXIST` `OSError`s in the retry loop (`capture_screenshot.py`, first reported 2026-07-03)**
+Still unresolved.
+
+**[low, carry-over] Partial git clone of repo into skills directory not cleaned up on interruption (`install.sh`, first reported 2026-06-26)**
+Still unresolved.
+
+**[low, carry-over] Test coverage gap: no test for `private_temp_png` failure modes other than name collision (`tests/test_capture_screenshot.py`, first reported 2026-06-18)**
+Still unresolved.
+
+### Data leaks
+
+No new findings.
+
+### UX
+
+**[info] Active-window capture on non-GNOME Linux desktops always fails with `missing_dependency_active_window` even when `scrot`+`xdotool` could serve the request (`capture_screenshot.py:277–286`)**
+
+`plan_capture` for `target == "active"` on Linux checks only for `gnome-screenshot`. If absent, it returns `missing_dependency_active_window` regardless of what other tools are present. On KDE, LXDE, or bare X11 desktops without GNOME, `scrot` combined with `xdotool getactivewindow` (or `xdotool getwindowfocus`) could capture the active window. The existing code silently ignores these tools for the `active` target.
+
+Suggested fix: when `gnome-screenshot` is absent and `scrot`+`xdotool` are both present, build a plan: `(xdotool, "getactivewindow")` → feed the returned window ID to `(import, "-window", "<id>", "{output}")`, or simply `(scrot, "--focused", "{output}")` (scrot supports `--focused` natively).
+
+**[low, carry-over] Unquoted `args_file` path in `test_windows_delegates_to_powershell` generated shell script (`tests/test_capture_screenshot.py:309`, first reported 2026-06-17, RE-FLAGGED)**
+Still unresolved.
+
+**[low, carry-over] No test asserts that whitespace-only `--query` triggers `EXIT_USAGE` (first reported 2026-07-01)**
+Still unresolved.
+
+**[low, carry-over] README "background/occluded capture" claim is not qualified for Linux X11 (first reported 2026-06-27)**
+Still unresolved.
+
+**[info, carry-over] macOS helper binary is recompiled from source on every capture invocation (first reported 2026-06-24)**
+Still unresolved.
+
+**[info, carry-over] PS1 has no `-OutputRoot` home-directory containment check when invoked directly (first reported 2026-06-23)**
+Still unresolved.

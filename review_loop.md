@@ -2832,3 +2832,87 @@ Still unresolved.
 
 **[info, carry-over] PS1 has no `-OutputRoot` home-directory containment check when invoked directly (first reported 2026-06-23)**
 Still unresolved.
+
+## 2026-07-05
+
+### Security
+
+**[medium, carry-over] PowerShell parameter injection via leading-dash `--query` values (`capture_screenshot.py`, `_run_powershell_script`, first reported 2026-06-25)**
+Still unresolved. A `--query` value beginning with `-` is forwarded to PowerShell as a bare argument and may be misinterpreted as a flag. Suggested fix: prefix each query value with `--` or validate that no query begins with `-` before forwarding.
+
+**[medium, carry-over] Whitespace-only `--query` value expands scope silently (`capture_screenshot.py`, first reported 2026-07-01)**
+Still unresolved. A blank or whitespace-only query string matches every window on macOS and every xdotool result on Linux. Exit `EXIT_USAGE` before entering any resolution path.
+
+**[medium, carry-over] Clipboard temp file written to world-accessible `/tmp` (`capture_screenshot.py:copy_file_to_clipboard`, first reported 2026-07-04)**
+Still unresolved. The file is created with `tempfile.NamedTemporaryFile` in the system temp directory, which is globally readable before the clipboard tool consumes it. Suggested fix: use a private directory with an explicit `0o600` mode, matching the `private_temp_png` pattern.
+
+**[low, carry-over] `ensure_private_directory` TOCTOU between symlink check and `mkdir` (`capture_screenshot.py:ensure_private_directory`, first reported 2026-07-02)**
+Still unresolved.
+
+**[low, carry-over] Compiled macOS helper binary is not integrity-checked between compilation and execution (`capture_screenshot.py`, first reported 2026-06-26)**
+Still unresolved.
+
+**[low, carry-over] `Path.home()` raises `RuntimeError` when `$HOME` is unset (`capture_screenshot.py:_validate_output_root`, first reported 2026-06-29)**
+Still unresolved.
+
+**[low, carry-over] `Move-Item` TOCTOU between `New-CapturePath` allocation and rename (`capture_screenshot.ps1`, first reported 2026-06-30)**
+Still unresolved.
+
+**[low, carry-over] `Protect-Directory` does not harden intermediate parent directories created by `New-Item -Force` (`capture_screenshot.ps1`, first reported 2026-07-01)**
+Still unresolved.
+
+### Bugs & regressions
+
+**[low, NEW] `copy_file_to_clipboard` has three `subprocess.run` calls without `timeout=` (`capture_screenshot.py:468–478`)**
+
+Each call to `wl-copy`, `xclip`, and `xsel` omits a `timeout=` argument. If a clipboard daemon hangs or blocks indefinitely on stdin, the CLI will never return. The 2026-07-04 entry covered missing timeouts on `run_command` and the clang compilation call, but this separate function was not addressed.
+
+Suggested fix: add `timeout=30` to each `subprocess.run` call and catch `subprocess.TimeoutExpired`, forwarding to `die("clipboard tool timed out", EXIT_UNAVAILABLE)`.
+
+**[high, carry-over] Linux X11 named-window clipboard path crashes with `KeyError: 'output'` (`capture_screenshot.py`, first reported 2026-06-10)**
+Still unresolved. The `execute_plan` clipboard branch calls `run_command(command)` without an `output=` argument, so the `{output}` placeholder in the import command template is never substituted and raises `KeyError`.
+
+**[high, carry-over] Unhandled `CalledProcessError` propagates as a raw Python traceback (`capture_screenshot.py:run_command`, first reported 2026-06-09)**
+Still unresolved. When a subprocess exits non-zero, the raw exception and traceback reach the terminal instead of a structured error message.
+
+**[medium, carry-over] `--query` flag value is silently discarded when `--target` is `fullscreen` or `active` (`capture_screenshot.py`, first reported 2026-06-13)**
+Still unresolved. No validation raises an error when `--query` is provided with a non-window target.
+
+**[medium, carry-over] Windows dry-run path allocation may produce duplicate filenames across invocations (`capture_screenshot.ps1:Get-RequestFolderPath`, first reported 2026-06-23)**
+Still unresolved. Second-level timestamp granularity means two calls within the same second return identical folder paths.
+
+**[low, carry-over] No test covers `_validate_output_root` rejecting paths outside `$HOME` (`tests/test_capture_screenshot.py`, first reported 2026-06-30)**
+Still unresolved.
+
+**[low, carry-over] `test_windows_delegates_to_powershell` does not assert `-OutputRoot` forwarding (`tests/test_capture_screenshot.py`, first reported 2026-06-26)**
+Still unresolved.
+
+**[low, carry-over] PS1 dry-run evaluates `Get-WindowBounds` before dry-run guard fires (`capture_screenshot.ps1`, first reported 2026-06-27)**
+Still unresolved.
+
+**[low, carry-over] `os.replace()` after `shutil.copy2` can raise unhandled `OSError` on cross-device moves (`capture_screenshot.py`, first reported 2026-06-29)**
+Still unresolved.
+
+**[low, carry-over] `private_temp_png` swallows non-EEXIST `OSError` in the allocation loop (`capture_screenshot.py`, first reported 2026-07-03)**
+Still unresolved. An I/O or permission error on the target directory causes the loop to silently continue rather than fail fast.
+
+**[low, carry-over] Unquoted `args_file` path in generated shell script in `test_windows_delegates_to_powershell` (`tests/test_capture_screenshot.py:309`, first reported 2026-06-17)**
+Still unresolved. A temp directory path containing spaces would break the `printf … > $args_file` line.
+
+### Data leaks
+
+No new findings. All window-title privacy invariants continue to hold across macOS, Linux, and Windows paths. The sanitize-label pipeline strips titles before output; only the app/owner name appears in filenames and console output.
+
+### UX
+
+**[low, carry-over] No test asserts that whitespace-only `--query` triggers `EXIT_USAGE` (first reported 2026-07-01)**
+Still unresolved.
+
+**[low, carry-over] README "background/occluded capture" claim is not qualified for Linux X11 (first reported 2026-06-27)**
+Still unresolved.
+
+**[info, carry-over] macOS helper binary is recompiled from source on every capture invocation (first reported 2026-06-24)**
+Still unresolved.
+
+**[info, carry-over] PS1 has no `-OutputRoot` home-directory containment check when invoked directly (first reported 2026-06-23)**
+Still unresolved.

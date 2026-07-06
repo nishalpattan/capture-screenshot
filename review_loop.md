@@ -2916,3 +2916,78 @@ Still unresolved.
 
 **[info, carry-over] PS1 has no `-OutputRoot` home-directory containment check when invoked directly (first reported 2026-06-23)**
 Still unresolved.
+
+---
+
+## 2026-07-06
+
+### Security
+
+**[low] `Protect-Directory` applies the owner-only ACL after directory creation, leaving a brief window with inherited permissions (`capture_screenshot.ps1:82–112`)**
+When `$Path` does not yet exist, `Protect-Directory` calls `New-Item -ItemType Directory … -Force`, which creates the directory with the parent's inherited ACL. The code then reads the ACL (`Get-Acl`), strips all existing entries, adds an owner-only `FullControl` rule, and writes it back (`Set-Acl`). During the interval between `New-Item` completing and `Set-Acl` completing — typically a few milliseconds but potentially longer under I/O pressure — any user or process with write permission on the parent directory can enumerate the newly-created folder, create files inside it, or read directory metadata. This applies to both the `$OutputRoot` directory and each per-request timestamp subdirectory. The analogous Python finding (TOCTOU between `is_symlink()` and `mkdir`, first reported 2026-06-08) applies to a different stage; this is specific to the ACL-application latency in the PowerShell path.
+_Suggested fix:_ Create the directory with a restrictive security descriptor from the start (using `New-Object System.Security.AccessControl.DirectorySecurity`, adding the owner-only ACE, then passing it to `New-Item -ItemType Directory … -SecurityDescriptor`), avoiding the inherited-then-overwrite sequence entirely.
+
+**[info] The 2026-06-13 `os.replace()` TOCTOU finding may be overstated for Linux (`capture_screenshot.py:512–514`)**
+The 2026-06-13 entry states that `os.replace(temp_output, output)` "atomically replaces the target of a symlink". On Linux, `os.replace()` calls `rename(2)`, which atomically replaces the destination *directory entry* (the symlink itself), not the file the symlink points to. A race-created symlink at `output` would therefore be replaced by the screenshot file without following the link — the write lands at the correct path. macOS `rename(2)` has the same semantics. The conservative guard (`output.is_symlink()` check before `os.replace`) remains worthwhile and should be kept, but the attack scenario described in 2026-06-13 may not be achievable in practice on POSIX systems. The finding should be re-verified or re-categorised as a belt-and-suspenders check rather than a live TOCTOU.
+
+### Bugs & regressions
+
+**[low] Multiple `--query` values that resolve to the same underlying window ID produce duplicate captures with different filenames, silently (`capture_screenshot.py:585–595`)**
+When `--allow-multiple-matches` is combined with multiple `--query` arguments (e.g., `--query Firefox --query Browser`), each query resolves its matching window IDs independently. If both queries return the same window ID — because one window's title or owner matches both terms — that ID appears in `window_ids` twice and `labels` contains both sanitized query strings. `plan_capture` builds one capture command per window ID (including duplicates), and `prepare_output_paths` produces two distinct filenames (e.g., `firefox.png` and `browser-001.png`). The same window is then captured twice, producing two files with identical pixel content but different names. No warning is emitted. This affects macOS and Linux; the Windows path independently enumerates per query but has the same duplication property.
+_Suggested fix:_ After collecting all `window_ids` and `labels` from queries in `main()`, deduplicate on `window_ids` using a `seen_ids` set while building the lists, and emit a warning to stderr when IDs are dropped.
+
+**[info] `Get-RequestFolderPath` (dry-run code path) does not call `Protect-Directory`, so reparse-point and non-directory checks on `$OutputRoot` are skipped in dry-run mode (`capture_screenshot.ps1:138–141, 351–354`)**
+In production mode, `New-RequestFolder` calls `Protect-Directory $OutputRoot`, which checks for reparse points before building the request folder path. In dry-run mode, `Get-RequestFolderPath` simply constructs the path string without any validation. A dry-run invocation with a reparse-point `$OutputRoot` (which would be refused in a real capture) will print paths that silently reference a location that would be rejected if the user removed `--dry-run`, misleading the user about where files would actually land.
+_Suggested fix:_ Add a lightweight reparse-point check in `Get-RequestFolderPath` (or at the dry-run call site), matching the guard already in `Protect-Directory`: check `(Get-Item -LiteralPath $OutputRoot -Force -ErrorAction SilentlyContinue).Attributes` for `ReparsePoint` and throw if found.
+
+### Carry-overs (most critical unresolved, for visibility)
+
+**[high, carry-over] Linux X11 named-window clipboard capture crashes with "internal error: missing output path" (`capture_screenshot.py`, first reported 2026-06-10)**
+Still unresolved.
+
+**[high, carry-over] Unhandled `CalledProcessError` from `subprocess.run(check=True)` propagates as raw Python traceback (`capture_screenshot.py:339,465`, first reported 2026-06-09)**
+Still unresolved.
+
+**[medium, carry-over] Clipboard temp file created in world-accessible `/tmp` rather than secured 0o700 request directory (`capture_screenshot.py:492`, first reported 2026-07-04)**
+Still unresolved.
+
+**[medium, carry-over] Whitespace-only or empty `--query` value silently expands capture scope to all visible windows (`capture_screenshot.py`, first reported 2026-06-13)**
+Still unresolved.
+
+**[medium, carry-over] PowerShell parameter injection via leading-dash `--query` values (`capture_screenshot.py:_run_powershell_script`, first reported 2026-06-25)**
+Still unresolved.
+
+**[low, carry-over] `copy_file_to_clipboard` subprocess calls have no `timeout=` (`capture_screenshot.py:468–478`, first reported 2026-07-05)**
+Still unresolved.
+
+**[low, carry-over] `private_temp_png` swallows non-`EEXIST` `OSError`s in the allocation loop (`capture_screenshot.py`, first reported 2026-07-03)**
+Still unresolved.
+
+**[low, carry-over] Unquoted `args_file` path in `test_windows_delegates_to_powershell` generated shell script (`tests/test_capture_screenshot.py:309`, first reported 2026-06-17)**
+Still unresolved.
+
+### Data leaks
+
+No new findings. All previously documented title-privacy invariants continue to hold across macOS, Linux, and Windows code paths. The duplicate-capture bug above produces duplicate pixel data under distinct filenames, but filenames continue to derive from the sanitized user query, never from window titles retrieved from the OS. The `Protect-Directory` ACL window exposes only directory existence and metadata to co-tenants, not screenshot content.
+
+### UX
+
+**[info] `detect_tools()` in `main()` scans the full cross-platform tool list regardless of current platform (`capture_screenshot.py:606–619`)**
+`detect_tools` is called unconditionally with the union of macOS and Linux tools (`screencapture`, `gnome-screenshot`, `grim`, `wl-copy`, `spectacle`, `scrot`, `import`, `xdotool`, `xclip`, `xsel`). On macOS every Linux-specific entry returns `None`; on Linux `screencapture` is never found. Each `shutil.which()` call is fast, so overhead is negligible, but a platform-gated tool list would reduce noise when debugging tool detection and align detection with the actual dispatch in `plan_capture`.
+_Suggested fix:_ Build the tool-name list conditionally on `platform_name` before calling `detect_tools`, passing only the tools relevant to the current platform.
+
+**[info] No test covers the duplicate-capture scenario where multiple `--query` values resolve to the same window ID (`tests/test_capture_screenshot.py`)**
+Consequent on the bug above: no test passes two query strings that produce an overlapping window ID and verifies — or flags as a defect — the resulting duplicate output paths. A regression in any deduplication fix would be silent.
+_Suggested fix:_ Add a test using `CAPTURE_SCREENSHOT_TEST_WINDOWS` with a single window entry whose owner matches two different `--query` values, asserting that only one output path is printed rather than two identical captures.
+
+**[low, carry-over] No test asserts that whitespace-only `--query` triggers `EXIT_USAGE` (first reported 2026-07-01)**
+Still unresolved.
+
+**[low, carry-over] README "background/occluded capture" claim is not qualified for Linux X11 (first reported 2026-06-27)**
+Still unresolved.
+
+**[info, carry-over] macOS helper binary is recompiled from source on every capture invocation (first reported 2026-06-24)**
+Still unresolved.
+
+**[info, carry-over] PS1 has no `-OutputRoot` home-directory containment check when invoked directly (first reported 2026-06-23)**
+Still unresolved.

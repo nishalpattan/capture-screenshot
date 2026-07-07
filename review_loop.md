@@ -2991,3 +2991,60 @@ Still unresolved.
 
 **[info, carry-over] PS1 has no `-OutputRoot` home-directory containment check when invoked directly (first reported 2026-06-23)**
 Still unresolved.
+
+## 2026-07-07
+
+### Security
+
+**[medium] `--query` value `--frontmost` is interpreted as a helper flag, silently capturing the frontmost window instead of searching for a match (`capture_screenshot.py:340–346`, `find_macos_window_id.m:41–48`)**
+In `resolve_macos_with_helper`, the user-supplied `query` string is appended to the helper command as a bare positional argument (`command.append(query)`). The compiled C helper's argument parser treats every token beginning with `--` as a flag before falling through to `query_arg`. Passing `--query --frontmost` therefore sets `frontmost = 1` in the C code, enabling frontmost-window mode regardless of the intended search term; the helper returns whatever window is currently on top rather than searching for a match. No error is raised and no warning is emitted. A value of `--allow-multiple` instead sets `allow_multiple = 1` with `query_arg = NULL`, triggering the usage-error path (exit 64), which Python maps to `window_query_failed` — so only `--frontmost` produces a silent behavioral bypass rather than an error.
+_Suggested fix:_ Separate flags from the query with a `--` sentinel in the helper invocation: build the command as `[str(helper)] + (["--allow-multiple"] if allow_multiple else []) + ["--", query]`, then update the C argument loop to stop flag processing at `"--"`. This is the standard POSIX convention for end-of-options.
+
+### Bugs & regressions
+
+**[medium] Window-name matching is case-insensitive on macOS but case-sensitive on Linux X11, causing identical queries to succeed on one platform and silently fail on the other (`find_macos_window_id.m:10`, `capture_screenshot.py:134`, `capture_screenshot.py:392`)**
+On macOS, `CFStringFind` is called with `kCFCompareCaseInsensitive` in the helper, and `_matches()` uses `.casefold()` for the in-process mock path, making all macOS window matching case-insensitive. On Linux, `resolve_linux_named_window` passes `_escape_ere(query)` verbatim to `xdotool search --name`, which applies POSIX ERE with default case-sensitive matching. A query of `--query terminal` succeeds on macOS when the owner is "Terminal" but returns "no matching window" on Linux unless the case matches exactly. Cross-platform agent scripts relying on this skill will exhibit inconsistent behaviour depending on the host OS.
+_Suggested fix:_ Wrap the escaped query in a case-insensitive ERE alternation before passing to xdotool, or prefix it with `(?i)` if the installed xdotool version supports Perl-compatible regex extensions. Alternatively, convert the query and each candidate name to lowercase in Python before passing the ERE, and document the case-normalisation.
+
+**[low] macOS fullscreen `screencapture` omits the `-x` (silence) flag, playing an audible camera shutter on fullscreen captures while named-window captures are silent (`capture_screenshot.py:220`)**
+The fullscreen branch at line 220 builds the command as `(screencapture, "{output}")` or `(screencapture, "-c")` with no `-x` flag. The named-window branches at lines 228 and 230 both include `-x`, suppressing sound. The result is that a fullscreen capture produces an audible shutter sound on macOS — potentially startling the user, breaking meeting recordings, or revealing that a capture occurred — while window captures are silent. There is no documented reason for this inconsistency.
+_Suggested fix:_ Add `-x` to both fullscreen command variants: `(screencapture, "-x", "{output}")` and `(screencapture, "-x", "-c")`.
+
+### Data leaks
+
+No new findings. The `--frontmost` bypass bug above causes the wrong window to be captured, but the captured image still goes to the user-specified, ACL-protected destination; no data leaks to third parties. Case-sensitivity mismatches affect window selection but not title disclosure. All previously verified title-privacy invariants (sanitized labels, no title in error messages, no title in filenames) remain intact.
+
+### UX
+
+**[info] `plan_capture` declares a `label: str` parameter that is never read inside the function (`capture_screenshot.py:200–299`)**
+The signature of `plan_capture` includes `label: str`, and the call site in `main()` supplies `label=labels[0] if labels else "capture"` (line 628). However, `label` is not referenced anywhere in the function body; all output-filename logic lives in `prepare_output_paths` / `unique_capture_path`, which are called before `plan_capture`. A reader of `plan_capture` may assume `label` influences the plan (e.g., that the output filename derives from it) when it does not. The dead parameter also appears in tests via `plan_capture(..., label="...", ...)` calls, which have no effect on the plan produced.
+_Suggested fix:_ Remove the `label` parameter from `plan_capture`'s signature and drop the corresponding `label=` argument from the call site in `main()`. Update any test assertions that pass `label=` to `plan_capture`.
+
+### Carry-overs (most critical unresolved, for visibility)
+
+**[high, carry-over] Linux X11 named-window clipboard capture crashes with "internal error: missing output path" (`capture_screenshot.py`, first reported 2026-06-10)**
+Still unresolved.
+
+**[high, carry-over] Unhandled `CalledProcessError` from `subprocess.run(check=True)` propagates as raw Python traceback (`capture_screenshot.py:339,465`, first reported 2026-06-09)**
+Still unresolved.
+
+**[medium, carry-over] Clipboard temp file created in world-accessible `/tmp` rather than secured 0o700 request directory (`capture_screenshot.py:492`, first reported 2026-07-04)**
+Still unresolved.
+
+**[medium, carry-over] Whitespace-only or empty `--query` value silently expands capture scope to all visible windows (`capture_screenshot.py`, first reported 2026-06-13)**
+Still unresolved.
+
+**[medium, carry-over] PowerShell parameter injection via leading-dash `--query` values (`capture_screenshot.py:_run_powershell_script`, first reported 2026-06-25)**
+Still unresolved.
+
+**[medium, carry-over] macOS `--allow-multiple-matches` + `--destination clipboard` silently discards all captures except the last (`capture_screenshot.py:225–231`, first reported 2026-06-11)**
+Still unresolved.
+
+**[low, carry-over] `copy_file_to_clipboard` subprocess calls have no `timeout=` (`capture_screenshot.py:468–478`, first reported 2026-07-05)**
+Still unresolved.
+
+**[low, carry-over] `private_temp_png` swallows non-`EEXIST` `OSError`s in the allocation loop (`capture_screenshot.py`, first reported 2026-07-03)**
+Still unresolved.
+
+**[low, carry-over] Unquoted `args_file` path in `test_windows_delegates_to_powershell` generated shell script (`tests/test_capture_screenshot.py:309`, first reported 2026-06-17)**
+Still unresolved.

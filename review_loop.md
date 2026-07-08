@@ -3048,3 +3048,132 @@ Still unresolved.
 
 **[low, carry-over] Unquoted `args_file` path in `test_windows_delegates_to_powershell` generated shell script (`tests/test_capture_screenshot.py:309`, first reported 2026-06-17)**
 Still unresolved.
+
+---
+
+## 2026-07-08
+
+### Security
+
+**[medium, NEW] `resolve_linux_named_window` passes user query to `xdotool --name` without a `--` end-of-options separator (`capture_screenshot.py:392`)**
+
+`xdotool search --name <pattern>` receives the query string as the final argument on the command list. Because `_escape_ere` only escapes POSIX ERE metacharacters and does not escape leading hyphens, a query passed as `--query=--someflag` (using argparse's `=` form to embed a leading dash) arrives at xdotool as a bare flag token (e.g., `xdotool search --name --onlyvisible`). Depending on the xdotool version and flag name, this either changes capture scope silently or produces an xdotool usage error that Python maps to `no_matching_window`. This parallels the macOS helper `--frontmost` injection found on 2026-07-07, but affects the Linux X11 path. The Python argparse definition (`action='append'`) means `--query --name` would fail argparse itself, but `--query=--name` succeeds and delivers the dash-prefixed string to `resolve_linux_named_window`.
+_Suggested fix:_ Insert a `--` sentinel before the pattern in the xdotool invocation: `[xdotool, "search", "--name", "--", _escape_ere(query)]`. Verify first that the installed xdotool version honours `--` (most POSIX-compliant parsers do); if not, reject queries starting with `-` in `resolve_linux_named_window` before building the command.
+
+**[low, NEW] `not_capturable_message` reflects the user query string into stderr without stripping control characters (`capture_screenshot.py:148–151`)**
+
+The function constructs error messages such as `f"'{query}' is minimized — restore it and retry."` where `query` is taken directly from `args.query` without sanitization. A query containing ANSI escape sequences (e.g., `\x1b[31m`) would inject terminal colour codes into the stderr stream, potentially disrupting log aggregators, CI output renderers, or terminal emulators that interpret escape codes. While the user controls their own query and the impact is self-inflicted in interactive use, automated callers that pipe stderr into structured logging or display systems could be affected.
+_Suggested fix:_ Strip non-printable characters before embedding the query in messages, e.g., `re.sub(r'[\x00-\x1f\x7f]', '', query)`, or simply replace any character outside printable ASCII/Unicode with `?`.
+
+**[medium, carry-over] `--query` value `--frontmost` interpreted as a helper flag on macOS (`capture_screenshot.py:340–346`, `find_macos_window_id.m:41–48`, first reported 2026-07-07)**
+Still unresolved.
+
+**[medium, carry-over] PowerShell parameter injection via leading-dash `--query` values (`capture_screenshot.py:_run_powershell_script`, first reported 2026-06-25)**
+Still unresolved.
+
+**[medium, carry-over] Clipboard temp file created by `NamedTemporaryFile` lands in world-accessible `/tmp` (`capture_screenshot.py:492`, first reported 2026-07-04)**
+Still unresolved.
+
+**[low, carry-over] `Protect-Directory` applies ACL after directory creation, leaving a brief window with inherited permissions (`capture_screenshot.ps1:82–112`, first reported 2026-07-06)**
+Still unresolved.
+
+**[low, carry-over] Compiled macOS helper binary is not integrity-checked between compilation and execution (`capture_screenshot.py`, first reported 2026-06-26)**
+Still unresolved.
+
+**[low, carry-over] `Path.home()` raises `RuntimeError` when `$HOME` is unset (`capture_screenshot.py:_validate_output_root`, first reported 2026-06-29)**
+Still unresolved.
+
+**[low, carry-over] `Move-Item` TOCTOU between `New-CapturePath` allocation and rename (`capture_screenshot.ps1`, first reported 2026-06-30)**
+Still unresolved.
+
+**[low, carry-over] `Protect-Directory` does not harden intermediate parent directories created by `New-Item -Force` (`capture_screenshot.ps1`, first reported 2026-07-01)**
+Still unresolved.
+
+### Bugs & regressions
+
+**[low, NEW] `execute_plan` desktop loop does not roll back successfully-written screenshots when a subsequent capture in the same request fails (`capture_screenshot.py:505–519`)**
+
+The multi-window capture loop calls `os.replace(temp_output, output)` and `print(output)` on each iteration before moving to the next window. If `run_command` succeeds for the first window but fails for the second (e.g., the second window closed between captures, which raises `CalledProcessError` from `check=True`), the first screenshot remains on disk and has already been printed to stdout, but the process exits non-zero. The caller cannot distinguish a complete capture from a partial one via the exit code alone. No rollback of successfully-written files occurs. This is amplified by the existing high-severity unhandled `CalledProcessError` bug (2026-06-09): the failure manifests as a raw Python traceback rather than a structured error message, making it harder to detect the partial state programmatically.
+_Suggested fix:_ Collect all `(command, output, temp_output)` tuples, attempt all captures writing to temp files first, then move all temp files to final destinations atomically as a second pass. On any failure in the first pass, clean up all temp files and exit cleanly before any final-destination file is written.
+
+**[info, NEW] `_test_windows()` raises bare `json.JSONDecodeError` for malformed `CAPTURE_SCREENSHOT_TEST_WINDOWS` input instead of calling `die()` (`capture_screenshot.py:310`)**
+
+`json.loads(raw)` is called without a try/except wrapper. A malformed JSON value in the environment variable (e.g., a truncated string or stray quote) produces an unhandled exception traceback rather than a structured `die()` exit with `EXIT_USAGE`. This only affects the testing/development path (`CAPTURE_SCREENSHOT_TEST_WINDOWS` is never set in production), but a developer mis-formatting the env-var value would see a confusing traceback rather than a clear usage error.
+_Suggested fix:_ Wrap the `json.loads(raw)` call in `try/except json.JSONDecodeError` and re-raise via `die("CAPTURE_SCREENSHOT_TEST_WINDOWS: invalid JSON", EXIT_USAGE)`.
+
+**[high, carry-over] Linux X11 named-window clipboard capture crashes with "internal error: missing output path" (`capture_screenshot.py`, first reported 2026-06-10)**
+Still unresolved.
+
+**[high, carry-over] Unhandled `CalledProcessError` from `subprocess.run(check=True)` propagates as raw Python traceback (`capture_screenshot.py:339,465`, first reported 2026-06-09)**
+Still unresolved.
+
+**[medium, carry-over] Case-insensitive matching on macOS vs. case-sensitive matching on Linux X11 for identical queries (`find_macos_window_id.m:10`, `capture_screenshot.py:134,392`, first reported 2026-07-07)**
+Still unresolved.
+
+**[medium, carry-over] Whitespace-only or empty `--query` value silently expands capture scope to all visible windows (`capture_screenshot.py`, first reported 2026-06-13)**
+Still unresolved.
+
+**[medium, carry-over] macOS `--allow-multiple-matches` + `--destination clipboard` silently discards all captures except the last (`capture_screenshot.py:225–231`, first reported 2026-06-11)**
+Still unresolved.
+
+**[medium, carry-over] Windows dry-run path allocation may produce duplicate folder paths across same-second invocations (`capture_screenshot.ps1:Get-RequestFolderPath`, first reported 2026-06-23)**
+Still unresolved.
+
+**[low, carry-over] macOS fullscreen `screencapture` omits `-x` silence flag, playing an audible shutter while named-window captures are silent (`capture_screenshot.py:220`, first reported 2026-07-07)**
+Still unresolved.
+
+**[low, carry-over] Multiple `--query` values resolving to the same underlying window ID produce duplicate captures without warning (`capture_screenshot.py:585–595`, first reported 2026-07-06)**
+Still unresolved.
+
+**[low, carry-over] `copy_file_to_clipboard` subprocess calls have no `timeout=` (`capture_screenshot.py:468–478`, first reported 2026-07-05)**
+Still unresolved.
+
+**[low, carry-over] `private_temp_png` swallows non-`EEXIST` `OSError`s in the allocation loop (`capture_screenshot.py`, first reported 2026-07-03)**
+Still unresolved.
+
+**[low, carry-over] `--query` flag value is silently discarded when `--target` is `fullscreen` or `active` (`capture_screenshot.py`, first reported 2026-06-13)**
+Still unresolved.
+
+**[low, carry-over] `os.replace()` after atomic temp write can raise unhandled `OSError` on cross-device moves (`capture_screenshot.py`, first reported 2026-06-29)**
+Still unresolved.
+
+**[low, carry-over] PS1 dry-run evaluates `Get-WindowBounds` before dry-run guard fires (`capture_screenshot.ps1`, first reported 2026-06-27)**
+Still unresolved.
+
+**[low, carry-over] No test covers `_validate_output_root` rejecting paths outside `$HOME` (`tests/test_capture_screenshot.py`, first reported 2026-06-30)**
+Still unresolved.
+
+**[low, carry-over] `test_windows_delegates_to_powershell` does not assert `-OutputRoot` forwarding (`tests/test_capture_screenshot.py`, first reported 2026-06-26)**
+Still unresolved.
+
+**[low, carry-over] Unquoted `args_file` path in generated shell script in `test_windows_delegates_to_powershell` (`tests/test_capture_screenshot.py:309`, first reported 2026-06-17)**
+Still unresolved.
+
+### Data leaks
+
+No new findings. The Linux xdotool leading-dash injection could redirect a capture to an unintended window, but the destination remains the user-controlled, ACL-protected output directory; no data reaches third parties. The `not_capturable_message` issue echoes the user's own query string back to the user, not any OS-retrieved window title; no title-privacy invariant is broken. All previously verified title-privacy invariants (sanitized labels, no title in error messages, no title in filenames) remain intact across macOS, Linux, and Windows paths.
+
+### UX
+
+**[info, NEW] `install.sh` clones from GitHub via HTTPS without commit-hash pinning or signature verification (`install.sh:27`)**
+
+`git clone --quiet "$REPO" "$dest"` always clones the current HEAD of the default branch with no integrity anchor. A compromised or force-pushed upstream commit would be silently installed for all new users without any indication that the content changed. For a privacy-first utility distributed as a directly-executable agent skill, this is a notable supply-chain consideration.
+_Suggested fix:_ Either document a specific commit SHA in the README that users can verify with `git log` after cloning, or add a post-clone `git verify-commit HEAD` step (if the repository signs releases), or at minimum add a note in the install output advising users to inspect the cloned scripts before running.
+
+**[low, carry-over] No test asserts that whitespace-only `--query` triggers `EXIT_USAGE` (first reported 2026-07-01)**
+Still unresolved.
+
+**[low, carry-over] README "background/occluded capture" claim is not qualified for Linux X11 (first reported 2026-06-27)**
+Still unresolved.
+
+**[info, carry-over] `plan_capture` declares a `label: str` parameter that is never read inside the function (`capture_screenshot.py:200–299`, first reported 2026-07-07)**
+Still unresolved.
+
+**[info, carry-over] `detect_tools()` scans the full cross-platform tool list regardless of current platform (`capture_screenshot.py:606–619`, first reported 2026-07-06)**
+Still unresolved.
+
+**[info, carry-over] macOS helper binary is recompiled from source on every capture invocation (first reported 2026-06-24)**
+Still unresolved.
+
+**[info, carry-over] PS1 has no `-OutputRoot` home-directory containment check when invoked directly (first reported 2026-06-23)**
+Still unresolved.

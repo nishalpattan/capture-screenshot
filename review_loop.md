@@ -3177,3 +3177,84 @@ Still unresolved.
 
 **[info, carry-over] PS1 has no `-OutputRoot` home-directory containment check when invoked directly (first reported 2026-06-23)**
 Still unresolved.
+
+---
+
+## 2026-07-09
+
+### Security
+
+No new findings. All previously documented security issues remain unresolved and are summarised in the carry-over block below.
+
+---
+
+### Bugs & regressions
+
+**[low, NEW] PowerShell multi-query loop does not roll back successfully-captured screenshots when a later query fails (`capture_screenshot.ps1:380–401`)**
+
+The `foreach ($queryText in $Query)` loop calls `Capture-ToDestination` and `Write-Output $path` for each matched handle before moving to the next query. If query N captures and prints successfully but query N+1 fails (e.g., `throw 'no matching on-screen window found'` or `exit 75` for a minimized window), query N's screenshot file remains on disk and its path has already been emitted to stdout. The script exits non-zero, but callers cannot distinguish a fully-completed multi-query capture from a partial one: both cases print some paths to stdout then exit with a non-zero code. This mirrors the Python finding from 2026-07-08 (`execute_plan` desktop loop), which covers the same gap in the Python path.
+_Suggested fix:_ Mirror the Python approach: write all captures to temp paths first, verify all succeed, then move to final destinations and print paths. On any failure, clean up all temp files and exit cleanly before emitting any final-destination path to stdout.
+
+---
+
+### Data leaks
+
+No new findings. All window-title privacy invariants continue to hold across macOS, Linux, and Windows code paths. The PS1 partial-capture bug above involves pixel data only; no window title metadata is written to stdout or any output file. All error messages continue to echo only user-supplied query strings, never OS-retrieved window titles.
+
+---
+
+### UX
+
+**[low, NEW] `run_command` does not redirect screenshot tool stdout; verbose tool output can contaminate the structured output contract (`capture_screenshot.py:452–465`)**
+
+`subprocess.run(args, check=True)` is invoked with no `stdout=` argument, so the called tool's stdout is inherited from the parent process. `capture_screenshot.py` emits a single file path (or `clipboard`) per capture on stdout; callers parse this line as the only output. If the underlying screenshot tool itself prints to stdout — for example, some `spectacle` builds emit `"Screenshot saved to /path"`, older `scrot` versions in verbose mode print the destination path, and certain `gnome-screenshot` builds print status — a spurious extra line appears on stdout before or after `print(output)`, breaking any caller that expects exactly one line per capture.
+_Suggested fix:_ Pass `stdout=subprocess.DEVNULL` (or `stdout=subprocess.PIPE` and discard) in `run_command`, unless the tool is expected to write its capture to stdout (none of the current tools do). Add stderr forwarding explicitly if tool error messages should still surface.
+
+**[low, NEW] `resolve_linux_named_window` spawns one `xprop`/`xwininfo` subprocess per matched window ID with no upper bound on subprocess count (`capture_screenshot.py:405`)**
+
+After `xdotool search --name` returns a list of window IDs, `_linux_window_is_viewable` is called for every ID in a list comprehension:
+```python
+classified = [(wid, _linux_window_is_viewable(wid, tools)) for wid in ids]
+```
+`_linux_window_is_viewable` spawns up to two subprocesses per ID (`xprop` then `xwininfo` as fallback). A generic query (e.g., `--query "e"`) matching hundreds of open browser tabs causes proportional subprocess spawning before the `multiple_matches` guard can fire. In a desktop with many open windows this can cause noticeable latency; in adversarial input scenarios (user passes a single-character query) it could saturate the subprocess pool.
+_Suggested fix:_ Apply an early limit — e.g., cap `ids` at 32 before entering `_linux_window_is_viewable` classification; return `multiple_matches` immediately if `ids` exceeds the cap. This eliminates O(N) subprocess spawning for clearly non-specific queries while preserving correct behaviour for typical usage.
+
+---
+
+### Carry-overs (critical unresolved, for visibility)
+
+**[high, carry-over] Linux X11 named-window clipboard capture crashes with "internal error: missing output path" (`capture_screenshot.py`, first reported 2026-06-10)**
+Still unresolved.
+
+**[high, carry-over] Unhandled `CalledProcessError` from `subprocess.run(check=True)` propagates as raw Python traceback (`capture_screenshot.py:339,465`, first reported 2026-06-09)**
+Still unresolved.
+
+**[medium, carry-over] `--query` value `--frontmost` silently captures the frontmost window on macOS instead of searching by name (`capture_screenshot.py:340–346`, `find_macos_window_id.m:41–48`, first reported 2026-07-07)**
+Still unresolved.
+
+**[medium, carry-over] `resolve_linux_named_window` passes user query to `xdotool --name` without a `--` end-of-options separator, allowing leading-dash injection (`capture_screenshot.py:392`, first reported 2026-07-08)**
+Still unresolved.
+
+**[medium, carry-over] PowerShell parameter injection via leading-dash `--query` values forwarded from Python (`capture_screenshot.py:_run_powershell_script`, first reported 2026-06-25)**
+Still unresolved.
+
+**[medium, carry-over] Clipboard temp file created by `NamedTemporaryFile` lands in world-accessible `/tmp` (`capture_screenshot.py:492`, first reported 2026-07-04)**
+Still unresolved.
+
+**[medium, carry-over] Whitespace-only or empty `--query` silently expands capture scope to all visible windows (`capture_screenshot.py`, first reported 2026-06-13)**
+Still unresolved.
+
+**[low, carry-over] `not_capturable_message` reflects user query into stderr without stripping control characters (`capture_screenshot.py:148–151`, first reported 2026-07-08)**
+Still unresolved.
+
+**[low, carry-over] `copy_file_to_clipboard` subprocess calls have no `timeout=` (`capture_screenshot.py:468–478`, first reported 2026-07-05)**
+Still unresolved.
+
+**[low, carry-over] `private_temp_png` swallows non-`EEXIST` `OSError`s in the allocation loop (`capture_screenshot.py`, first reported 2026-07-03)**
+Still unresolved.
+
+**[low, carry-over] macOS fullscreen `screencapture` omits `-x` silence flag, playing audible shutter while named-window captures are silent (`capture_screenshot.py:220`, first reported 2026-07-07)**
+Still unresolved.
+
+**[low, carry-over] Unquoted `args_file` path in `test_windows_delegates_to_powershell` generated shell script (`tests/test_capture_screenshot.py:309`, first reported 2026-06-17)**
+Still unresolved.

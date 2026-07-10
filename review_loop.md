@@ -3258,3 +3258,96 @@ Still unresolved.
 
 **[low, carry-over] Unquoted `args_file` path in `test_windows_delegates_to_powershell` generated shell script (`tests/test_capture_screenshot.py:309`, first reported 2026-06-17)**
 Still unresolved.
+
+---
+
+## 2026-07-10
+
+### Security
+
+**[low, NEW] `ensure_private_directory` catches `PermissionError` only, leaving other `OSError` subclasses unhandled in a privacy-critical code path (`capture_screenshot.py:109`)**
+
+`ensure_private_directory` wraps `path.chmod(0o700)` in:
+```python
+try:
+    path.chmod(0o700)
+except PermissionError:
+    die("could not secure screenshots folder permissions", EXIT_PRIVACY)
+```
+`path.chmod()` can raise `OSError` subclasses beyond `PermissionError`: `OSError(EROFS)` on a read-only filesystem, `OSError(EPERM)` from a security policy (e.g., SELinux or AppArmor denial that is not mapped to EACCES), or `NotADirectoryError`. These propagate as unhandled Python exceptions — a raw traceback with implicit exit code 1 — rather than a structured `die()` message with `EXIT_PRIVACY`. This is the same gap reported for `secure_file()` on 2026-06-18 (line 117–121), but `ensure_private_directory` (line 109) was not covered by that finding. The function is called for both the output root and per-request subdirectory, making this path privacy-critical.
+_Suggested fix:_ Broaden to `except OSError as e:` and call `die(f"could not secure screenshots folder permissions: {e.strerror}", EXIT_PRIVACY)`, consistent with the fix proposed for `secure_file()` on 2026-06-18.
+
+---
+
+### Bugs & regressions
+
+No new findings. All known bugs are listed in the carry-over section below.
+
+---
+
+### Data leaks
+
+No new findings. Window-title privacy invariants continue to hold across all three platform paths. All error messages echo only the user-supplied query or static text; no OS-retrieved window title reaches any output channel. The `ensure_private_directory` OSError gap (Security above) exposes only the structured error message, not screenshot content or title metadata.
+
+---
+
+### UX
+
+**[info, NEW] `--allow-multiple-matches` with a broad query produces O(N) capture operations with no warning or soft cap (`capture_screenshot.py:225–231`, `execute_plan`)**
+
+When `--allow-multiple-matches` is set and a short or generic query matches N windows, `plan_capture` builds N capture commands and `execute_plan` runs them sequentially. On macOS this means N `screencapture -l <id>` invocations each writing a PNG to disk; on Linux X11 it means N `import -window <id>` invocations. No count is previewed before capture begins, no warning is emitted when N exceeds a reasonable threshold, and no soft limit prevents a pathological query (e.g., `--query "e"` on a system with 60+ open windows) from saturating disk I/O or producing dozens of unexpected files. The 2026-07-09 entry documented unbounded *resolution-phase* xprop/xwininfo subprocess spawning on Linux; this is a distinct issue about unbounded *capture-phase* operations on all platforms.
+_Suggested fix:_ After collecting `window_ids` in `main()` and before invoking `plan_capture`, print a warning to stderr when `len(window_ids)` exceeds a threshold (e.g., 10): `"warning: --allow-multiple-matches matched N windows — capturing all of them."` Optionally add a `--max-matches INT` flag to enforce a hard cap.
+
+**[info, NEW] `install.sh` `$HOME`-unset risk from 2026-06-10 is mitigated by `set -u`; the remaining concern is an empty-string `$HOME` (`install.sh:2,36,41,47`)**
+
+The 2026-06-10 entry warned that an unset `$HOME` causes `"$HOME/.claude/skills"` to expand to `"/.claude/skills"`. However, `install.sh` starts with `set -euo pipefail` (line 2); the `-u` flag causes bash to abort with "HOME: unbound variable" before any path is evaluated if `$HOME` is genuinely unset. The unset case is therefore already safe. The remaining concern is `HOME=""` (exported as an empty string, which `-u` does not flag): `"$HOME/.claude/skills"` evaluates to `"/.claude/skills"`, and on a machine where `/.claude/skills` happens to exist (e.g., a pre-built container image), `clone_if_missing` would attempt to write there — potentially as root on a system account. The remediation from 2026-06-10 (`[ -z "$HOME" ] && exit 1`) is correct but should use `[ -z "${HOME:-}" ]` to be safe under `set -u`, or test for both unset and empty: `[[ -z "${HOME-unset}" || "$HOME" == "unset" ]]`.
+_Suggested fix:_ Replace the proposed guard with: `[[ -z "${HOME:-}" ]] && { echo "error: \$HOME is not set or is empty"; exit 1; }` near the top of the script.
+
+---
+
+### Carry-overs (critical unresolved, for visibility)
+
+**[high, carry-over] Linux X11 named-window clipboard capture crashes with "internal error: missing output path" (`capture_screenshot.py`, first reported 2026-06-10)**
+Still unresolved.
+
+**[high, carry-over] Unhandled `CalledProcessError` from `subprocess.run(check=True)` propagates as raw Python traceback (`capture_screenshot.py:339,465`, first reported 2026-06-09)**
+Still unresolved.
+
+**[medium, carry-over] `--query` value `--frontmost` silently captures the frontmost window on macOS instead of searching by name (`capture_screenshot.py:340–346`, `find_macos_window_id.m:41–48`, first reported 2026-07-07)**
+Still unresolved.
+
+**[medium, carry-over] `resolve_linux_named_window` passes user query to `xdotool --name` without a `--` end-of-options separator, allowing leading-dash injection (`capture_screenshot.py:392`, first reported 2026-07-08)**
+Still unresolved.
+
+**[medium, carry-over] PowerShell parameter injection via leading-dash `--query` values forwarded from Python (`capture_screenshot.py:_run_powershell_script`, first reported 2026-06-25)**
+Still unresolved.
+
+**[medium, carry-over] Clipboard temp file created by `NamedTemporaryFile` lands in world-accessible `/tmp` (`capture_screenshot.py:492`, first reported 2026-07-04)**
+Still unresolved.
+
+**[medium, carry-over] Whitespace-only or empty `--query` silently expands capture scope to all visible windows (`capture_screenshot.py`, first reported 2026-06-13)**
+Still unresolved.
+
+**[medium, carry-over] macOS `--allow-multiple-matches` + `--destination clipboard` silently discards all captures except the last (`capture_screenshot.py:225–231`, first reported 2026-06-11)**
+Still unresolved.
+
+**[low, carry-over] `not_capturable_message` reflects user query into stderr without stripping control characters (`capture_screenshot.py:148–151`, first reported 2026-07-08)**
+Still unresolved.
+
+**[low, carry-over] `copy_file_to_clipboard` subprocess calls have no `timeout=` (`capture_screenshot.py:468–478`, first reported 2026-07-05)**
+Still unresolved.
+
+**[low, carry-over] `private_temp_png` swallows non-`EEXIST` `OSError`s in the allocation loop (`capture_screenshot.py`, first reported 2026-07-03)**
+Still unresolved.
+
+**[low, carry-over] macOS fullscreen `screencapture` omits `-x` silence flag, playing audible shutter while named-window captures are silent (`capture_screenshot.py:220`, first reported 2026-07-07)**
+Still unresolved.
+
+**[low, carry-over] Multiple `--query` values resolving to the same underlying window ID produce duplicate captures without warning (`capture_screenshot.py:585–595`, first reported 2026-07-06)**
+Still unresolved.
+
+**[low, carry-over] `run_command` does not redirect screenshot tool stdout; verbose tool output can contaminate the structured output contract (`capture_screenshot.py:452–465`, first reported 2026-07-09)**
+Still unresolved.
+
+**[low, carry-over] Unquoted `args_file` path in `test_windows_delegates_to_powershell` generated shell script (`tests/test_capture_screenshot.py:309`, first reported 2026-06-17)**
+Still unresolved.

@@ -3437,3 +3437,107 @@ Still unresolved.
 
 **[info, carry-over] `install.sh` `HOME=""` risk: an exported empty-string `$HOME` passes `-u` guard and expands clone paths to `/.claude/skills/...` (`install.sh:2,36,41,47`, first reported 2026-07-10)**
 Still unresolved.
+
+---
+
+## 2026-07-12
+
+### Security
+
+**[medium, NEW] PowerShell parameter-binding injection via leading-dash `--query` values (`capture_screenshot.py`, `_run_powershell_script`)**
+
+`_run_powershell_script` appends each `--query` value verbatim as `["-Query", q]` to the PowerShell command list. If `q` starts with `-` and matches a named parameter in `capture_screenshot.ps1` — specifically `-OutputRoot`, `-DryRun`, or `-AllowMultipleMatches` — PowerShell's argument parser consumes it as that parameter rather than as the string value for `$Query`. A query of `-OutputRoot` followed by a subsequent token would bind that token to `$OutputRoot`, potentially overriding the home-validated path Python explicitly passes later. A query of `-DryRun` could silently suppress the actual capture. Because the query string derives from user-supplied window/app names, a user can craft a value that triggers this.
+_Suggested fix:_ Add a guard in `_run_powershell_script` that rejects any `--query` value beginning with `-` (e.g. `if q.startswith("-"): die("query must not begin with '-'", EXIT_USAGE)`), or insert the PowerShell stop-parsing token `--%` immediately before the query arguments, or validate inside the `.ps1` that no `$Query` element starts with `-`.
+
+**[info, NEW] TOCTOU between `_validate_output_root` and `ensure_private_directory` via intermediate-component symlink replacement (`capture_screenshot.py`, `_validate_output_root` / `ensure_private_directory`)**
+
+`_validate_output_root` calls `path.resolve()` (which follows all symlinks) and confirms the canonical path is within the user's home. `ensure_private_directory` later checks `path.is_symlink()` only on the final path component. In the window between these two calls an attacker with write access to a parent directory could replace an intermediate component (e.g. swap `~/Desktop` for a link to `/etc`). The final-component `is_symlink()` check returns False for the not-yet-created leaf, `mkdir(parents=True)` follows the intermediate symlink, and the directory is created outside the home. Exploitation requires write access to directories the user already controls, limiting real-world impact.
+_Suggested fix:_ After computing the safe canonical path, `mkdir()` against the resolved (canonical) path directly rather than the user-supplied path, so intermediate-component changes after `resolve()` have no effect.
+
+---
+
+### Bugs & regressions
+
+**[low, NEW] `_linux_window_is_viewable` xwininfo parse may false-positive on a window title containing "isviewable" (`capture_screenshot.py`, `_linux_window_is_viewable`)**
+
+```python
+return "isviewable" in proc.stdout.lower().replace(" ", "")
+```
+
+`xwininfo` includes the window title on the first output line (e.g. `xwininfo: Window id: 0x1234 "IsViewable Dashboard"`). The check scans the full stdout after space removal. A window whose title happens to contain the substring "isviewable" would be classified as Map State = IsViewable regardless of its actual map state, potentially causing the script to attempt to capture a minimized or unmapped window.
+_Suggested fix:_ Isolate the Map State line before checking: `m = re.search(r'map state:\s*(\S+)', proc.stdout, re.IGNORECASE)` and compare `m.group(1).lower() == "isviewable"` only if the match succeeds.
+
+**[low, NEW] Unhandled `subprocess.CalledProcessError` from `copy_file_to_clipboard` produces a raw Python traceback (`capture_screenshot.py`, `copy_file_to_clipboard` / `execute_plan`)**
+
+`copy_file_to_clipboard` calls `subprocess.run(..., check=True)` for `wl-copy`, `xclip`, and `xsel`. If any exits non-zero (e.g. no Wayland compositor, no X display, xclip crashes), `CalledProcessError` propagates uncaught through `execute_plan` and `main()`, emitting a raw Python traceback that includes full binary paths rather than a structured error message with a defined exit code. This is distinct from the existing timeout carry-over (process hangs) — this is the process-fails-immediately path.
+_Suggested fix:_ Wrap the `subprocess.run` call in `copy_file_to_clipboard` in `try/except subprocess.CalledProcessError as e: die(f"clipboard tool failed ({e.returncode})", EXIT_UNAVAILABLE)`. Apply the same pattern to `run_command` for consistency.
+
+---
+
+### Data leaks
+
+No new findings. Window-title privacy invariants remain intact across all platform paths; the xwininfo false-positive above risks a failed capture attempt, not a title disclosure.
+
+---
+
+### UX
+
+**[low, NEW] `Find-WindowHandles` in PowerShell matches all visible windows when `$Needle` is an empty string (`capture_screenshot.ps1`, `Find-WindowHandles`)**
+
+`[string].IndexOf("", [StringComparison]::OrdinalIgnoreCase)` always returns 0 (≥ 0), so an empty query string forwarded from Python causes `Find-WindowHandles` to collect every visible window. Python's `main()` verifies `args.query` has at least one element but does not reject the empty-string element, so `--query ""` reaches PowerShell unblocked. The result is either a "multiple matching windows found" error or, with `-AllowMultipleMatches`, a bulk capture of the entire desktop. This is the PowerShell-specific analogue of the existing whitespace-only `--query` carry-over on macOS/Linux.
+_Suggested fix:_ Add `if ([string]::IsNullOrWhiteSpace($queryText)) { throw 'query must not be empty or whitespace' }` at the top of the `foreach ($queryText in $Query)` loop; also add a parallel guard in `main()` in `capture_screenshot.py`.
+
+---
+
+### Carry-overs (unresolved from prior entries)
+
+**[low, carry-over] `CGWindowID` stored in a signed `int` in `find_macos_window_id.m` (first reported 2026-06-11)**
+Still unresolved.
+
+**[medium, carry-over] Clipboard temp file created by `NamedTemporaryFile` lands in world-accessible `/tmp` (`capture_screenshot.py`, `execute_plan`, first reported 2026-07-04)**
+Still unresolved.
+
+**[medium, carry-over] Whitespace-only or empty `--query` silently expands capture scope to all visible windows (`capture_screenshot.py`, first reported 2026-06-13)**
+Still unresolved.
+
+**[medium, carry-over] macOS `--allow-multiple-matches` + `--destination clipboard` silently discards all captures except the last (`capture_screenshot.py`, first reported 2026-06-11)**
+Still unresolved.
+
+**[low, carry-over] `not_capturable_message` reflects user query into stderr without stripping control characters (`capture_screenshot.py:148–151`, first reported 2026-07-08)**
+Still unresolved.
+
+**[low, carry-over] `copy_file_to_clipboard` subprocess calls have no `timeout=` (`capture_screenshot.py`, first reported 2026-07-05)**
+Still unresolved.
+
+**[low, carry-over] `private_temp_png` swallows non-`EEXIST` `OSError`s in the allocation loop (`capture_screenshot.py`, first reported 2026-07-03)**
+Still unresolved.
+
+**[low, carry-over] macOS fullscreen `screencapture` omits `-x` silence flag, playing audible shutter while named-window captures are silent (`capture_screenshot.py`, first reported 2026-07-07)**
+Still unresolved.
+
+**[low, carry-over] Multiple `--query` values resolving to the same underlying window ID produce duplicate captures without warning (`capture_screenshot.py`, first reported 2026-07-06)**
+Still unresolved.
+
+**[low, carry-over] `run_command` does not redirect screenshot tool stdout; verbose tool output can contaminate the structured output contract (`capture_screenshot.py`, first reported 2026-07-09)**
+Still unresolved.
+
+**[low, carry-over] Unquoted `args_file` path in `test_windows_delegates_to_powershell` generated shell script (`tests/test_capture_screenshot.py:309`, first reported 2026-06-17)**
+Still unresolved.
+
+**[low, carry-over] `ensure_private_directory` catches `PermissionError` only, leaving other `OSError` subclasses unhandled in a privacy-critical code path (`capture_screenshot.py`, first reported 2026-07-10)**
+Still unresolved.
+
+**[info, carry-over] `--allow-multiple-matches` with a broad query produces O(N) capture operations with no warning or soft cap (`capture_screenshot.py`, `execute_plan`, first reported 2026-07-10)**
+Still unresolved.
+
+**[info, carry-over] `install.sh` `HOME=""` risk: an exported empty-string `$HOME` passes `-u` guard and expands clone paths to `/.claude/skills/...` (`install.sh`, first reported 2026-07-10)**
+Still unresolved.
+
+**[low, carry-over] PowerShell script lacks home-containment validation when invoked directly, bypassing `_validate_output_root` (`capture_screenshot.ps1`, first reported 2026-07-11)**
+Still unresolved.
+
+**[low, carry-over] `Get-WindowTitle` truncates window titles at 1024 characters, causing missed matches for long titles (`capture_screenshot.ps1`, `Get-WindowTitle`, first reported 2026-07-11)**
+Still unresolved.
+
+**[low, carry-over] `resolve_macos_with_helper` lets `subprocess.CalledProcessError` propagate uncaught if `clang` compilation fails (`capture_screenshot.py`, `resolve_macos_with_helper`, first reported 2026-07-11)**
+Still unresolved.

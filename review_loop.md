@@ -3541,3 +3541,132 @@ Still unresolved.
 
 **[low, carry-over] `resolve_macos_with_helper` lets `subprocess.CalledProcessError` propagate uncaught if `clang` compilation fails (`capture_screenshot.py`, `resolve_macos_with_helper`, first reported 2026-07-11)**
 Still unresolved.
+
+---
+
+## 2026-07-13
+
+Source reviewed: `scripts/capture_screenshot.py`, `scripts/capture_screenshot.ps1`, `scripts/find_macos_window_id.m`, `tests/test_capture_screenshot.py`, `install.sh`. No code changes landed on `main` since the 2026-07-12 review.
+
+---
+
+### Security
+
+No new findings. The intermediate-component symlink TOCTOU between `_validate_output_root` and `ensure_private_directory` (reported 2026-07-12) and the leading-dash PowerShell parameter-binding injection (reported 2026-07-12) remain the outstanding items. PowerShell's `Capture-ToDestination` also has a narrow window between the `Get-Item` reparse-point check and the subsequent `Move-Item`, but the screenshot directory is locked to the current user via `Protect-Directory` ACLs, so no external principal can plant a reparse point there; this is informational only.
+
+---
+
+### Bugs & regressions
+
+**[low, NEW] `xdotool search --name` performs case-sensitive ERE matching while all other resolution paths use case-insensitive comparison (`capture_screenshot.py`, `resolve_linux_named_window`, line 392)**
+
+`resolve_linux_named_window` passes `_escape_ere(query)` directly to `xdotool search --name`. `xdotool` calls POSIX `regcomp(3)` with `REG_EXTENDED` and no `REG_ICASE` flag, so the match is case-sensitive. In contrast, `_matches()` uses `casefold()` (case-insensitive), the macOS CoreFoundation search uses `kCFCompareCaseInsensitive`, and the Windows `IndexOf` comparison uses `StringComparison::OrdinalIgnoreCase`. A user who queries `"firefox"` on Linux will silently get `no_matching_window` when the window title is `"Firefox"` — the same query that succeeds on macOS and Windows.
+
+_Suggested fix:_ Build a case-insensitive POSIX ERE by converting each alphabetic character in the escaped query to a character class (`f` → `[fF]`, etc.):
+```python
+def _ere_case_insensitive(value: str) -> str:
+    result = []
+    for ch in _escape_ere(value):
+        if ch.isalpha():
+            result.append(f"[{ch.lower()}{ch.upper()}]")
+        else:
+            result.append(ch)
+    return "".join(result)
+```
+Then use `_ere_case_insensitive(query)` in the `xdotool` invocation. (POSIX ERE via glibc does not support the `(?i)` inline flag, so character-class expansion is the portable approach.)
+
+---
+
+### Data leaks
+
+No new findings. Privacy invariants (window-title never echoed back, labels derived from user queries rather than OS titles) remain intact across all platform paths reviewed.
+
+---
+
+### UX
+
+**[low, NEW] `clang` compilation in `resolve_macos_with_helper` is not silenced: warnings and informational output from the compiler appear on the user's terminal (`capture_screenshot.py`, `resolve_macos_with_helper`, line 339)**
+
+```python
+subprocess.run([clang, "-framework", "ApplicationServices", str(helper_source), "-o", str(helper)], check=True)
+```
+
+`stdout` and `stderr` are inherited from the parent process. On some macOS configurations clang emits deprecation warnings (e.g. for `CGWindowListCopyWindowInfo`, which Apple has flagged deprecated in macOS 14+). These warnings are printed to the calling terminal interleaved with the tool's structured output (file paths or error codes expected by the agent). If `check=True` raises `CalledProcessError`, the error message contains no compilation detail because stderr was never captured.
+
+_Suggested fix:_ Add `capture_output=True`; on non-zero return, re-raise as a structured `die(f"clang failed: {proc.stderr.strip()}", EXIT_UNAVAILABLE)` so the caller gets a readable error. On success the captured stderr can be discarded to keep console output clean.
+
+**[info, NEW] `plan_capture` accepts a `label: str` parameter that is never used within the function body (`capture_screenshot.py`, `plan_capture`, lines 200–299)**
+
+AST analysis confirms `label` is absent from all name references inside `plan_capture`. The label only affects file naming via `prepare_output_paths` / `unique_capture_path`, not the command tuples. The unused parameter creates a misleading API surface that could prompt a future contributor to wire it into a command argument expecting that it is already sanitized (it is, via `sanitize_label`, but that happens at the call site, not inside `plan_capture`).
+
+_Suggested fix:_ Remove `label` from `plan_capture`'s signature and the corresponding argument at its single call site (line 628). No other change is required.
+
+---
+
+### Carry-overs (unresolved from prior entries)
+
+**[low, carry-over] `CGWindowID` stored in a signed `int` in `find_macos_window_id.m` (first reported 2026-06-11)**
+Still unresolved.
+
+**[medium, carry-over] Clipboard temp file created by `NamedTemporaryFile` lands in world-accessible `/tmp` (`capture_screenshot.py`, `execute_plan`, first reported 2026-07-04)**
+Still unresolved.
+
+**[medium, carry-over] Whitespace-only or empty `--query` silently expands capture scope to all visible windows (`capture_screenshot.py`, first reported 2026-06-13)**
+Still unresolved.
+
+**[medium, carry-over] macOS `--allow-multiple-matches` + `--destination clipboard` silently discards all captures except the last (`capture_screenshot.py`, first reported 2026-06-11)**
+Still unresolved.
+
+**[low, carry-over] `not_capturable_message` reflects user query into stderr without stripping control characters (`capture_screenshot.py:148–151`, first reported 2026-07-08)**
+Still unresolved.
+
+**[low, carry-over] `copy_file_to_clipboard` subprocess calls have no `timeout=` (`capture_screenshot.py`, first reported 2026-07-05)**
+Still unresolved.
+
+**[low, carry-over] `private_temp_png` swallows non-`EEXIST` `OSError`s in the allocation loop (`capture_screenshot.py`, first reported 2026-07-03)**
+Still unresolved.
+
+**[low, carry-over] macOS fullscreen `screencapture` omits `-x` silence flag, playing audible shutter while named-window captures are silent (`capture_screenshot.py`, first reported 2026-07-07)**
+Still unresolved.
+
+**[low, carry-over] Multiple `--query` values resolving to the same underlying window ID produce duplicate captures without warning (`capture_screenshot.py`, first reported 2026-07-06)**
+Still unresolved.
+
+**[low, carry-over] `run_command` does not redirect screenshot tool stdout; verbose tool output can contaminate the structured output contract (`capture_screenshot.py`, first reported 2026-07-09)**
+Still unresolved.
+
+**[low, carry-over] Unquoted `args_file` path in `test_windows_delegates_to_powershell` generated shell script (`tests/test_capture_screenshot.py:309`, first reported 2026-06-17)**
+Still unresolved.
+
+**[low, carry-over] `ensure_private_directory` catches `PermissionError` only, leaving other `OSError` subclasses unhandled in a privacy-critical code path (`capture_screenshot.py`, first reported 2026-07-10)**
+Still unresolved.
+
+**[info, carry-over] `--allow-multiple-matches` with a broad query produces O(N) capture operations with no warning or soft cap (`capture_screenshot.py`, `execute_plan`, first reported 2026-07-10)**
+Still unresolved.
+
+**[info, carry-over] `install.sh` `HOME=""` risk: an exported empty-string `$HOME` passes `-u` guard and expands clone paths to `/.claude/skills/...` (`install.sh`, first reported 2026-07-10)**
+Still unresolved.
+
+**[low, carry-over] PowerShell script lacks home-containment validation when invoked directly, bypassing `_validate_output_root` (`capture_screenshot.ps1`, first reported 2026-07-11)**
+Still unresolved.
+
+**[low, carry-over] `Get-WindowTitle` truncates window titles at 1024 characters, causing missed matches for long titles (`capture_screenshot.ps1`, `Get-WindowTitle`, first reported 2026-07-11)**
+Still unresolved.
+
+**[low, carry-over] `resolve_macos_with_helper` lets `subprocess.CalledProcessError` propagate uncaught if `clang` compilation fails (`capture_screenshot.py`, `resolve_macos_with_helper`, first reported 2026-07-11)**
+Still unresolved.
+
+**[medium, carry-over] PowerShell parameter-binding injection via leading-dash `--query` values (`capture_screenshot.py`, `_run_powershell_script`, first reported 2026-07-12)**
+Still unresolved.
+
+**[info, carry-over] TOCTOU between `_validate_output_root` and `ensure_private_directory` via intermediate-component symlink replacement (`capture_screenshot.py`, first reported 2026-07-12)**
+Still unresolved.
+
+**[low, carry-over] `_linux_window_is_viewable` xwininfo parse may false-positive on a window title containing "isviewable" (`capture_screenshot.py`, `_linux_window_is_viewable`, first reported 2026-07-12)**
+Still unresolved.
+
+**[low, carry-over] Unhandled `subprocess.CalledProcessError` from `copy_file_to_clipboard` produces a raw Python traceback (`capture_screenshot.py`, `copy_file_to_clipboard` / `execute_plan`, first reported 2026-07-12)**
+Still unresolved.
+
+**[low, carry-over] `Find-WindowHandles` in PowerShell matches all visible windows when `$Needle` is an empty string (`capture_screenshot.ps1`, `Find-WindowHandles`, first reported 2026-07-12)**
+Still unresolved.

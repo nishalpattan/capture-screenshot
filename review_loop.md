@@ -3830,3 +3830,101 @@ Still unresolved.
 
 **[info, carry-over] `plan_capture` declares a `label: str` parameter that is never read inside the function (`capture_screenshot.py`, first reported 2026-07-07)**
 Still unresolved.
+
+## 2026-07-15
+
+### Security
+
+**[low, NEW] `unique_capture_path` does not check for dangling symlinks (`capture_screenshot.py:93`)**
+`unique_capture_path` uses `candidate.exists()` to decide whether a filename slot is free. `Path.exists()` returns `False` for a dangling symlink (one whose target does not exist), so a dangling symlink at `label.png` is selected as the output path. `execute_plan` then guards with `output.exists() or output.is_symlink()` (line ~496) and rejects the path with "refusing to overwrite an existing screenshot path" — a confusing error because no visible file exists. The inconsistency also means that on any future refactor that removes the `execute_plan` guard, the dangling symlink becomes a write target. Fix: change the check to `candidate.exists() or candidate.is_symlink()` to match `execute_plan`.
+
+**[low, NEW] `Protect-File` applies Windows ACL with no post-ACL verification (`capture_screenshot.ps1:115-128`)**
+`Protect-File` calls `Set-Acl` to restrict the screenshot file to the current user and returns immediately with no verification that the ACL was applied. By contrast, Python's `ensure_private_directory` reads back the mode with `path.stat()` and asserts `mode & 0o077 == 0` after `chmod`. On Windows, `Set-Acl` can silently fail in certain edge cases (e.g., a filesystem that does not support DACLs, a Remote Desktop session where the underlying share overrides ACLs). Fix: after `Set-Acl`, re-read the ACL with `Get-Acl` and verify that only the expected identity's rule is present, mirroring Python's post-chmod stat check.
+
+### Bugs & regressions
+
+**[low, NEW] `Copy-Rectangle` result is never checked for all-black pixels (`capture_screenshot.ps1:295-349`)**
+`Test-BitmapAllBlack` is called only when `$Handle -ne [IntPtr]::Zero` (the `Copy-Window`/`PrintWindow` path, line 309). The `else` branch at line 314 calls `Copy-Rectangle` (`CopyFromScreen`) for fullscreen and active-without-handle captures but never checks the resulting bitmap. In headless Remote Desktop, Citrix, or Server Core sessions where GPU acceleration is disabled, `CopyFromScreen` completes without throwing but returns a solid-black bitmap. The script saves the black PNG, emits the file path, and exits 0 — no advisory warning. Fix: call `Test-BitmapAllBlack` on the `Copy-Rectangle` result and emit the same `[Console]::Error.WriteLine` advisory that `Copy-Window` emits.
+
+**[info, NEW] `_linux_window_is_viewable` xprop-failure-with-xwininfo-fallback path is not tested (`tests/test_capture_screenshot.py`)**
+Existing tests cover: (a) xprop present and returns "Iconic" → not viewable; (b) xprop present and returns "Normal" → viewable; (c) only xwininfo present → viewable; (d) neither tool present → IDs kept. No test covers xprop present but exiting with a non-zero status code, which should cause fallthrough to the xwininfo branch. Fix: add a test with a fake xprop that returns exit 1 and a fake xwininfo that returns "IsViewable", asserting the result is viewable (`result.ok == True`).
+
+### Data leaks
+
+No new findings.
+
+### UX
+
+**[low, NEW] `_run_powershell_script` subprocess call has no timeout (`capture_screenshot.py:546`)**
+`subprocess.run(cmd)` at line 546 omits a `timeout` parameter, so a hung PowerShell invocation blocks the Python process indefinitely. Prior entries (2026-06-11 for `run_command`/`clang`, 2026-07-05 for `copy_file_to_clipboard`) covered adjacent call sites; this delegation call to the PowerShell script was not previously documented. A hung PowerShell invocation can arise from GDI exhaustion, a Windows permission dialog waiting for a button click, or MTA clipboard operations that stall. Fix: pass `timeout=120` and catch `subprocess.TimeoutExpired` with a user-readable error message.
+
+### Carry-overs from 2026-07-14
+
+**[medium, carry-over] `ensure_private_directory` creates the directory before confirming no symlink occupies the path (`capture_screenshot.py`, `ensure_private_directory`, first reported 2026-06-08)**
+Still unresolved.
+
+**[medium, carry-over] `screencapture -l` window-ID integer overflow: CGWindowID is `uint32_t` but stored as signed `int` in the helper; IDs > 2 147 483 647 wrap negative (`find_macos_window_id.m:86`, first reported 2026-06-08)**
+Still unresolved.
+
+**[medium, carry-over] `plan_capture` (Linux/X11 window) calls `shlex.quote` on `window_ids` but `xdotool search` already has the ERE query injected unquoted via `_escape_ere`, and a crafted window name could still affect downstream tools (`capture_screenshot.py`, first reported 2026-06-10)**
+Still unresolved.
+
+**[medium, carry-over] `_run_powershell_script` forwards `--query` values into `-Query` without shell-escaping them against PowerShell injection (`capture_screenshot.py`, first reported 2026-06-25)**
+Still unresolved.
+
+**[low, carry-over] `copy_file_to_clipboard` reads the entire PNG into memory with no size cap before passing it to `pbcopy`/`xclip`/`xsel` subprocess (`capture_screenshot.py`, first reported 2026-07-05)**
+Still unresolved.
+
+**[low, carry-over] `copy_file_to_clipboard` subprocess call has no timeout; a stalled clipboard daemon blocks the process indefinitely (`capture_screenshot.py`, first reported 2026-07-05)**
+Still unresolved.
+
+**[low, carry-over] `_run_powershell_script`: `powershell.exe` is resolved from `$PATH` without checking that the resolved binary is inside a trusted system directory, allowing a rogue `powershell.exe` earlier in `$PATH` to be executed (`capture_screenshot.py`, first reported 2026-07-12)**
+Still unresolved.
+
+**[low, carry-over] `resolve_macos_with_helper`: compiled helper binary written to a world-accessible temp directory; concurrent attacker could replace the binary between write and exec (`capture_screenshot.py`, first reported 2026-06-08)**
+Still unresolved.
+
+**[low, carry-over] `ensure_private_directory`: post-chmod mode check does not account for a concurrent `chmod` between the tool's `chmod` and the `stat` read (TOCTOU) (`capture_screenshot.py`, first reported 2026-06-12)**
+Still unresolved.
+
+**[low, carry-over] `find_macos_window_id.m`: multiple positional arguments silently select the last one; any argument after the flags is accepted as the query with no error for unexpected extras (first reported 2026-06-15)**
+Still unresolved.
+
+**[low, carry-over] `find_macos_window_id.m`: passing both `--frontmost` and a query string silently ignores the query and returns the frontmost window regardless (first reported 2026-06-15)**
+Still unresolved.
+
+**[low, carry-over] `sanitize_label` strips only `https?://` URL prefixes; other URL schemes (ftp://, file://, ssh://) are not stripped and can appear verbatim in file names (`capture_screenshot.py`, first reported 2026-06-17)**
+Still unresolved.
+
+**[low, carry-over] `resolve_macos_with_helper`: clang is invoked with no timeout; if the compiler hangs, the Python process blocks indefinitely (`capture_screenshot.py`, first reported 2026-06-11)**
+Still unresolved.
+
+**[low, carry-over] `install.sh` uses `git clone` over HTTPS with no integrity check (no pinned commit hash, no signature verification); a compromised upstream tag silently installs malicious code (first reported 2026-06-20)**
+Still unresolved.
+
+**[low, carry-over] `install.sh` does not verify that the cloned files are owned by the current user before adding them to the skill directories, allowing a race between clone and install on multi-user systems (first reported 2026-06-20)**
+Still unresolved.
+
+**[low, carry-over] `xdotool search --name` receives the ERE pattern without a `--` separator, so a window name beginning with `--` could be misinterpreted as a flag by xdotool (`capture_screenshot.py`, first reported 2026-07-08)**
+Still unresolved.
+
+**[info, carry-over] `resolve_macos_with_helper` recompiles the Objective-C helper on every invocation even when the binary already exists and the source has not changed (`capture_screenshot.py`, first reported 2026-06-22)**
+Still unresolved.
+
+**[info, carry-over] `_validate_output_root` rejects output roots outside `$HOME`, but `$HOME` itself is not validated to be an absolute path; a relative `$HOME` (e.g. exported as `HOME=.`) passes the containment check with unintended results (`capture_screenshot.py`, first reported 2026-06-28)**
+Still unresolved.
+
+**[info, carry-over] `execute_plan` clipboard path uses `tempfile.NamedTemporaryFile` (in /tmp, world-readable until `secure_file` is called) rather than `private_temp_png` inside the secured output directory (`capture_screenshot.py`, first reported 2026-07-01)**
+Still unresolved.
+
+**[info, carry-over] `plan_capture` Linux/Wayland branch checks only for `grim` + `wl-copy`; no fallback for `grim` + `wl-clipboard`, and no Wayland fullscreen path without `wl-copy` (`capture_screenshot.py`, first reported 2026-07-03)**
+Still unresolved.
+
+**[info, carry-over] `--allow-multiple-matches` with a broad query produces O(N) capture operations with no warning or soft cap (`capture_screenshot.py`, `execute_plan`, first reported 2026-07-10)**
+Still unresolved.
+
+**[info, carry-over] `install.sh` `HOME=""` risk: an exported empty-string `$HOME` passes `-u` guard and expands clone paths to `/.claude/skills/...` (`install.sh`, first reported 2026-07-10)**
+Still unresolved.
+
+**[info, carry-over] `plan_capture` declares a `label: str` parameter that is never read inside the function (`capture_screenshot.py`, first reported 2026-07-07)**
+Still unresolved.
